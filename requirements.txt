@@ -1,11 +1,13 @@
 fastapi
-uvicorn[standard]
-sqlalchemy[asyncio]
+uvicorn
+sqlalchemy
 aiosqlite
+asyncpg
 pydantic
 pydantic-settings
+httpx
 PyJWT
-openai-agents
 openai
+openai-agents
 python-multipart
 python-dotenv

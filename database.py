@@ -6,14 +6,15 @@ import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./mailbrain.db")
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+# Build engine kwargs
+engine_kwargs = {"echo": False}
+if "neon.tech" in DATABASE_URL or "postgresql" in DATABASE_URL:
+    engine_kwargs["connect_args"] = {"ssl": "require"}
+
+engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
-
-# ──────────────────────────────────────────────
-# Models
-# ──────────────────────────────────────────────
 
 class User(Base):
     __tablename__ = "users"
@@ -38,34 +39,26 @@ class Email(Base):
     subject             = Column(String)
     body                = Column(Text)
     received_at         = Column(DateTime)
-
-    # AI Analysis
-    intent              = Column(String)        # support_request | refund | sales | meeting | complaint | spam | urgent
-    priority            = Column(String)        # CRITICAL | HIGH | NORMAL | LOW
+    intent              = Column(String)
+    priority            = Column(String)
     priority_score      = Column(Float)
-    sentiment           = Column(String)        # positive | neutral | negative
+    sentiment           = Column(String)
     language            = Column(String, default="en")
     summary             = Column(Text)
-    action_taken        = Column(String)        # auto_reply | assigned | ticket | meeting | flagged | info_request
+    action_taken        = Column(String)
     assigned_department = Column(String)
     confidence_score    = Column(Float)
-
-    # Response
     generated_reply     = Column(Text)
     reply_sent          = Column(Boolean, default=False)
     reply_sent_at       = Column(DateTime)
-
-    # Workflow
     ticket_id           = Column(String)
     meeting_scheduled   = Column(Boolean, default=False)
     follow_up_at        = Column(DateTime)
     escalated           = Column(Boolean, default=False)
-
-    # Metadata
     raw_headers         = Column(JSON)
     ai_metadata         = Column(JSON)
     processed_at        = Column(DateTime, default=datetime.utcnow)
-    status              = Column(String, default="processed")  # processed | pending | error
+    status              = Column(String, default="processed")
 
 
 class AutomationRule(Base):
@@ -73,9 +66,9 @@ class AutomationRule(Base):
     id          = Column(Integer, primary_key=True, autoincrement=True)
     user_id     = Column(String)
     name        = Column(String)
-    condition   = Column(JSON)   # {"intent": "refund", "priority": "HIGH"}
-    action      = Column(JSON)   # {"type": "assign", "department": "billing"}
-    approved    = Column(Integer, default=0)   # learned approval count
+    condition   = Column(JSON)
+    action      = Column(JSON)
+    approved    = Column(Integer, default=0)
     created_at  = Column(DateTime, default=datetime.utcnow)
 
 
@@ -89,13 +82,14 @@ class ActivityLog(Base):
     created_at  = Column(DateTime, default=datetime.utcnow)
 
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
-
 async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        print("✅ Database initialized")
+    except Exception as e:
+        print(f"❌ Database init error: {e}")
+        raise
 
 
 async def get_db():
