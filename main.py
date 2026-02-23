@@ -20,7 +20,7 @@ app.add_middleware(
     CORSMiddleware,
     # allow_origins=["http://06-mailbrain.vercel.app", "https://06-mailbrain.vercel.app", "http://localhost:3000"],
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
