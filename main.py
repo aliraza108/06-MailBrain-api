@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from typing import Optional
 import email as stdlib_email
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +22,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Section 2: Configuration
+if load_dotenv:
+    load_dotenv()
+
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "https://06-mailbrain-api.vercel.app/auth/callback")
@@ -303,6 +310,190 @@ async def ai_analyze(subject: str, body: str, sender: str, thread_ctx: str = Non
     except Exception:
         return {"success": False, "data": _rule_based(subject, body)}
 
+
+async def _llm_generate_email(system_prompt: str, user_prompt: str) -> str:
+    if not GEMINI_KEY:
+        return "Thank you for your email. I will review this and get back to you shortly."
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                f"{AI_URL}chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GEMINI_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": AI_MODEL,
+                    "temperature": 0.35,
+                    "max_tokens": 900,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+        text = (
+            resp.json()
+            .get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+        return text or "Thank you for your email. I will follow up with details soon."
+    except Exception:
+        return "Thank you for your message. I will get back to you shortly."
+
+
+def _build_reply_prompt(data) -> tuple[str, str]:
+    system = (
+        "You are an elite business email assistant. "
+        "Write clear, concise, human-sounding replies. "
+        "Do not mention AI, tools, or internal reasoning. "
+        "Output plain email body only."
+    )
+    sender_line = f"Sender name: {data.sender_name}\n" if data.sender_name else ""
+    conv_line = f"Conversation ID: {data.conversation_id}\n" if data.conversation_id else ""
+    user = (
+        f"Write an email reply in language: {data.language}.\n"
+        f"Tone: {data.tone}\n"
+        f"{sender_line}{conv_line}"
+        f"Original subject: {data.subject}\n"
+        f"Original email body:\n{data.body}\n\n"
+        "Requirements:\n"
+        "- Start with a natural greeting.\n"
+        "- Acknowledge the sender's core point.\n"
+        "- Provide a concrete next step.\n"
+        "- End with a short professional sign-off.\n"
+        "- Keep it under 170 words unless needed."
+    )
+    return system, user
+
+
+def _build_general_email_prompt(data) -> tuple[str, str]:
+    system = (
+        "You write high-conversion professional emails. "
+        "Keep messages practical and specific. "
+        "Output plain email body only."
+    )
+    user = (
+        f"Generate a complete email in language: {data.language}.\n"
+        f"Purpose: {data.purpose}\n"
+        f"Audience: {data.audience or 'General professional audience'}\n"
+        f"Tone: {data.tone}\n"
+        f"Context:\n{data.context or 'N/A'}\n"
+        f"Call to action: {data.cta or 'Suggest a reasonable next step'}\n\n"
+        "Requirements:\n"
+        "- Subject-compatible email body with greeting + concise structure.\n"
+        "- Use short paragraphs.\n"
+        "- Include one clear CTA.\n"
+        "- Avoid generic fluff."
+    )
+    return system, user
+
+
+def _build_job_email_prompt(data) -> tuple[str, str]:
+    system = (
+        "You are a senior career coach and recruiter-grade writer. "
+        "Create tailored job outreach/application emails. "
+        "Output plain email body only."
+    )
+    user = (
+        f"Generate a tailored job email in language: {data.language}.\n"
+        f"Recipient email: {data.recipient_email}\n"
+        f"Candidate name: {data.candidate_name or 'Candidate'}\n"
+        f"Tone: {data.tone}\n"
+        f"Candidate background:\n{data.candidate_background or 'N/A'}\n"
+        f"Portfolio URL: {data.portfolio_url or 'N/A'}\n"
+        f"Job post content:\n{data.job_post_body}\n\n"
+        "Requirements:\n"
+        "- Mention role fit using 2-3 specific points from the job post.\n"
+        "- Highlight measurable impact from candidate background if possible.\n"
+        "- Ask for interview/next step politely.\n"
+        "- Keep between 140 and 220 words."
+    )
+    return system, user
+
+
+def _build_proposal_prompt(data) -> tuple[str, str]:
+    system = (
+        "You are an expert freelancer/agency proposal writer. "
+        "Write persuasive, concrete project proposals via email. "
+        "Output plain email body only."
+    )
+    user = (
+        f"Generate a client proposal email in language: {data.language}.\n"
+        f"Client email: {data.customer_email}\n"
+        f"Sender name: {data.sender_name or 'Consultant'}\n"
+        f"Company name: {data.company_name or 'Independent'}\n"
+        f"Tone: {data.tone}\n"
+        f"Offer summary: {data.offer_summary or 'Provide solution proposal'}\n"
+        f"Timeline: {data.timeline or 'Provide realistic timeline'}\n"
+        f"Budget hint: {data.budget_hint or 'Provide budget range if appropriate'}\n"
+        f"Client post / requirement:\n{data.post_body}\n\n"
+        "Requirements:\n"
+        "- Start with understanding of client problem.\n"
+        "- Provide approach with milestones.\n"
+        "- Add deliverables and timeline.\n"
+        "- Include one CTA for meeting/approval.\n"
+        "- Keep it concise and outcome-focused."
+    )
+    return system, user
+
+
+def _build_followup_prompt(data) -> tuple[str, str]:
+    system = (
+        "You write high-response follow-up emails that are polite and concise. "
+        "Output plain email body only."
+    )
+    user = (
+        f"Write a follow-up email in language: {data.language}.\n"
+        f"Tone: {data.tone}\n"
+        f"Days since last email: {data.days_since_last_email}\n"
+        f"Objective: {data.objective}\n"
+        f"Previous email:\n{data.previous_email_body}\n\n"
+        "Requirements:\n"
+        "- Keep under 120 words.\n"
+        "- Include a clear CTA.\n"
+        "- Stay respectful and non-pushy."
+    )
+    return system, user
+
+
+def _build_subjects_prompt(data) -> tuple[str, str]:
+    system = (
+        "You write high-performing email subject lines. "
+        "Return each subject on a new line only, with no numbering."
+    )
+    count = max(1, min(int(data.count or 5), 10))
+    user = (
+        f"Generate {count} email subject lines.\n"
+        f"Language: {data.language}\n"
+        f"Tone: {data.tone}\n"
+        f"Goal: {data.goal}\n"
+        f"Audience: {data.audience or 'General'}\n"
+        "Requirements: concise, specific, no clickbait."
+    )
+    return system, user
+
+
+def _build_improve_prompt(data) -> tuple[str, str]:
+    system = (
+        "You improve email drafts for clarity and conversion. "
+        "Output only the improved email body."
+    )
+    user = (
+        f"Improve this draft in language: {data.language}\n"
+        f"Tone: {data.tone}\n"
+        f"Objective: {data.objective}\n"
+        f"Draft:\n{data.draft_body}\n\n"
+        "Requirements:\n"
+        "- Keep original intent.\n"
+        "- Make it clearer and more concise.\n"
+        "- Add one explicit call-to-action."
+    )
+    return system, user
+
 # Section 7: Gmail Helpers
 
 def _b64_decode(data: str) -> str:
@@ -419,6 +610,16 @@ async def _send_email(token, to, subject, body, thread_id=None) -> dict:
     if thread_id:
         payload["threadId"] = thread_id
     return await _gmail_post(token, "/users/me/messages/send", payload)
+
+
+async def _send_email_with_refresh(db: AsyncSession, user: User, to: str, subject: str, body: str, thread_id: Optional[str] = None) -> dict:
+    try:
+        return await _send_email(user.access_token, to, subject, body, thread_id)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401 and user.refresh_token:
+            await _refresh_google_token(db, user)
+            return await _send_email(user.access_token, to, subject, body, thread_id)
+        raise
 
 
 async def _fetch_unread(token, max_results=20) -> list:
@@ -556,6 +757,114 @@ class ReplyIn(BaseModel):
 
 class DevTokenIn(BaseModel):
     email: str
+
+
+class GenerateReplyIn(BaseModel):
+    subject: str
+    body: str
+    conversation_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    tone: Optional[str] = "professional"
+    language: Optional[str] = "en"
+
+
+class SendEmailIn(BaseModel):
+    to: str
+    subject: str
+    body: str
+    conversation_id: Optional[str] = None
+
+
+class GenerateEmailIn(BaseModel):
+    purpose: str
+    audience: Optional[str] = None
+    context: Optional[str] = ""
+    tone: Optional[str] = "professional"
+    language: Optional[str] = "en"
+    cta: Optional[str] = ""
+
+
+class GenerateJobEmailIn(BaseModel):
+    job_post_body: str
+    recipient_email: str
+    candidate_name: Optional[str] = ""
+    candidate_background: Optional[str] = ""
+    portfolio_url: Optional[str] = ""
+    tone: Optional[str] = "confident"
+    language: Optional[str] = "en"
+
+
+class GenerateProposalIn(BaseModel):
+    post_body: str
+    customer_email: str
+    sender_name: Optional[str] = ""
+    company_name: Optional[str] = ""
+    offer_summary: Optional[str] = ""
+    timeline: Optional[str] = ""
+    budget_hint: Optional[str] = ""
+    tone: Optional[str] = "consultative"
+    language: Optional[str] = "en"
+
+
+class GenerateFollowUpIn(BaseModel):
+    previous_email_body: str
+    objective: str
+    days_since_last_email: Optional[int] = 3
+    tone: Optional[str] = "polite"
+    language: Optional[str] = "en"
+
+
+class GenerateAndSendIn(BaseModel):
+    to: str
+    subject: str
+    purpose: str
+    audience: Optional[str] = None
+    context: Optional[str] = ""
+    tone: Optional[str] = "professional"
+    language: Optional[str] = "en"
+    cta: Optional[str] = ""
+    conversation_id: Optional[str] = None
+
+
+class JobApplySendIn(BaseModel):
+    recipient_email: str
+    job_post_body: str
+    candidate_name: Optional[str] = ""
+    candidate_background: Optional[str] = ""
+    portfolio_url: Optional[str] = ""
+    subject: Optional[str] = "Application for the role"
+    tone: Optional[str] = "confident"
+    language: Optional[str] = "en"
+    conversation_id: Optional[str] = None
+
+
+class ProposalSendIn(BaseModel):
+    customer_email: str
+    post_body: str
+    sender_name: Optional[str] = ""
+    company_name: Optional[str] = ""
+    offer_summary: Optional[str] = ""
+    timeline: Optional[str] = ""
+    budget_hint: Optional[str] = ""
+    subject: Optional[str] = "Project Proposal"
+    tone: Optional[str] = "consultative"
+    language: Optional[str] = "en"
+    conversation_id: Optional[str] = None
+
+
+class SubjectIdeasIn(BaseModel):
+    goal: str
+    audience: Optional[str] = ""
+    tone: Optional[str] = "professional"
+    language: Optional[str] = "en"
+    count: Optional[int] = 5
+
+
+class ImproveDraftIn(BaseModel):
+    draft_body: str
+    objective: str
+    tone: Optional[str] = "professional"
+    language: Optional[str] = "en"
 
 # Section 10: Routes
 
@@ -957,6 +1266,238 @@ async def send_reply(
     e.generated_reply = reply.body
     await db.commit()
     return {"message": "Reply sent", "email_id": email_id}
+
+
+@app.post("/emails/generate-reply")
+async def generate_reply(
+    data: GenerateReplyIn,
+    user: User = Depends(auth),
+):
+    system_prompt, user_prompt = _build_reply_prompt(data)
+    reply_body = await _llm_generate_email(system_prompt, user_prompt)
+    return {
+        "subject": f"Re: {data.subject}" if not data.subject.lower().startswith("re:") else data.subject,
+        "reply_body": reply_body,
+        "conversation_id": data.conversation_id,
+        "model": AI_MODEL,
+    }
+
+
+@app.post("/emails/send")
+async def send_email_direct(
+    data: SendEmailIn,
+    user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token")
+    sent = await _send_email_with_refresh(
+        db,
+        user,
+        data.to,
+        data.subject,
+        data.body,
+        data.conversation_id,
+    )
+    return {
+        "message": "Email sent",
+        "gmail_id": sent.get("id"),
+        "thread_id": sent.get("threadId"),
+    }
+
+
+@app.post("/emails/generate")
+async def generate_email(
+    data: GenerateEmailIn,
+    user: User = Depends(auth),
+):
+    system_prompt, user_prompt = _build_general_email_prompt(data)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    return {"email_body": body, "model": AI_MODEL}
+
+
+@app.post("/emails/generate/job")
+async def generate_job_email(
+    data: GenerateJobEmailIn,
+    user: User = Depends(auth),
+):
+    system_prompt, user_prompt = _build_job_email_prompt(data)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    return {
+        "to": data.recipient_email,
+        "suggested_subject": "Application for the role",
+        "email_body": body,
+        "model": AI_MODEL,
+    }
+
+
+@app.post("/emails/generate/proposal")
+async def generate_proposal_email(
+    data: GenerateProposalIn,
+    user: User = Depends(auth),
+):
+    system_prompt, user_prompt = _build_proposal_prompt(data)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    return {
+        "to": data.customer_email,
+        "suggested_subject": "Project Proposal",
+        "email_body": body,
+        "model": AI_MODEL,
+    }
+
+
+@app.post("/emails/generate/follow-up")
+async def generate_follow_up_email(
+    data: GenerateFollowUpIn,
+    user: User = Depends(auth),
+):
+    system_prompt, user_prompt = _build_followup_prompt(data)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    return {
+        "suggested_subject": "Quick follow-up",
+        "email_body": body,
+        "model": AI_MODEL,
+    }
+
+
+@app.post("/emails/generate-and-send")
+async def generate_and_send_email(
+    data: GenerateAndSendIn,
+    user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token")
+    prompt_data = GenerateEmailIn(
+        purpose=data.purpose,
+        audience=data.audience,
+        context=data.context,
+        tone=data.tone,
+        language=data.language,
+        cta=data.cta,
+    )
+    system_prompt, user_prompt = _build_general_email_prompt(prompt_data)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    sent = await _send_email_with_refresh(
+        db,
+        user,
+        data.to,
+        data.subject,
+        body,
+        data.conversation_id,
+    )
+    return {
+        "message": "Generated and sent",
+        "to": data.to,
+        "subject": data.subject,
+        "email_body": body,
+        "gmail_id": sent.get("id"),
+        "thread_id": sent.get("threadId"),
+        "model": AI_MODEL,
+    }
+
+
+@app.post("/emails/job-apply/send")
+async def job_apply_send(
+    data: JobApplySendIn,
+    user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token")
+    gen = GenerateJobEmailIn(
+        job_post_body=data.job_post_body,
+        recipient_email=data.recipient_email,
+        candidate_name=data.candidate_name,
+        candidate_background=data.candidate_background,
+        portfolio_url=data.portfolio_url,
+        tone=data.tone,
+        language=data.language,
+    )
+    system_prompt, user_prompt = _build_job_email_prompt(gen)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    sent = await _send_email_with_refresh(
+        db,
+        user,
+        data.recipient_email,
+        data.subject or "Application for the role",
+        body,
+        data.conversation_id,
+    )
+    return {
+        "message": "Job application email generated and sent",
+        "to": data.recipient_email,
+        "subject": data.subject or "Application for the role",
+        "email_body": body,
+        "gmail_id": sent.get("id"),
+        "thread_id": sent.get("threadId"),
+        "model": AI_MODEL,
+    }
+
+
+@app.post("/emails/proposal/send")
+async def proposal_send(
+    data: ProposalSendIn,
+    user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
+):
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token")
+    gen = GenerateProposalIn(
+        post_body=data.post_body,
+        customer_email=data.customer_email,
+        sender_name=data.sender_name,
+        company_name=data.company_name,
+        offer_summary=data.offer_summary,
+        timeline=data.timeline,
+        budget_hint=data.budget_hint,
+        tone=data.tone,
+        language=data.language,
+    )
+    system_prompt, user_prompt = _build_proposal_prompt(gen)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    sent = await _send_email_with_refresh(
+        db,
+        user,
+        data.customer_email,
+        data.subject or "Project Proposal",
+        body,
+        data.conversation_id,
+    )
+    return {
+        "message": "Proposal email generated and sent",
+        "to": data.customer_email,
+        "subject": data.subject or "Project Proposal",
+        "email_body": body,
+        "gmail_id": sent.get("id"),
+        "thread_id": sent.get("threadId"),
+        "model": AI_MODEL,
+    }
+
+
+@app.post("/emails/generate/subjects")
+async def generate_subject_ideas(
+    data: SubjectIdeasIn,
+    user: User = Depends(auth),
+):
+    system_prompt, user_prompt = _build_subjects_prompt(data)
+    raw = await _llm_generate_email(system_prompt, user_prompt)
+    lines = [ln.strip("- ").strip() for ln in raw.splitlines() if ln.strip()]
+    count = max(1, min(int(data.count or 5), 10))
+    ideas = lines[:count] if lines else []
+    if not ideas:
+        ideas = ["Quick follow-up", "Proposal for your review", "Next steps"]
+    return {"subjects": ideas, "model": AI_MODEL}
+
+
+@app.post("/emails/generate/improve")
+async def improve_email_draft(
+    data: ImproveDraftIn,
+    user: User = Depends(auth),
+):
+    system_prompt, user_prompt = _build_improve_prompt(data)
+    body = await _llm_generate_email(system_prompt, user_prompt)
+    return {"email_body": body, "model": AI_MODEL}
 
 # Analytics Routes
 
