@@ -82,6 +82,20 @@ class User(Base):
     created_at    = Column(DateTime, default=datetime.utcnow)
 
 
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+    user_id             = Column(String, primary_key=True)
+    full_name           = Column(String)
+    role_title          = Column(String)
+    company_name        = Column(String)
+    writing_tone        = Column(String, default="professional")
+    signature           = Column(Text)
+    custom_system_prompt = Column(Text)
+    default_language    = Column(String, default="en")
+    created_at          = Column(DateTime, default=datetime.utcnow)
+    updated_at          = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class EmailRecord(Base):
     __tablename__ = "emails"
     id                  = Column(String, primary_key=True)
@@ -121,6 +135,28 @@ class ActivityLog(Base):
     action     = Column(String)
     details    = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+async def _get_user_profile(db: AsyncSession, user_id: str) -> Optional[UserProfile]:
+    res = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
+    return res.scalar_one_or_none()
+
+
+async def _get_or_create_user_profile(db: AsyncSession, user: User) -> UserProfile:
+    profile = await _get_user_profile(db, user.id)
+    if profile:
+        return profile
+    profile = UserProfile(
+        user_id=user.id,
+        full_name=user.name or "",
+        default_language="en",
+        writing_tone="professional",
+        signature=user.name or "",
+    )
+    db.add(profile)
+    await db.commit()
+    await db.refresh(profile)
+    return profile
 
 async def get_db():
     async with SessionFactory() as session:
@@ -234,16 +270,17 @@ def _rule_based(subject: str, body: str) -> dict:
     }
 
 
-async def ai_analyze(subject: str, body: str, sender: str, thread_ctx: str = None) -> dict:
+async def ai_analyze(subject: str, body: str, sender: str, thread_ctx: str = None, profile_ctx: str = "") -> dict:
     if not GEMINI_KEY:
         return {"success": False, "data": _rule_based(subject, body)}
 
     thread_part = f"\nPREVIOUS THREAD:\n{thread_ctx[:600]}" if thread_ctx else ""
+    profile_part = f"\nUSER PROFILE CONTEXT:\n{profile_ctx[:1200]}\n" if profile_ctx else ""
     prompt = (
         "Analyze this email. Return ONLY valid JSON. No markdown. No backticks.\n\n"
         f"FROM: {sender}\n"
         f"SUBJECT: {subject}\n"
-        f"BODY: {(body or '')[:3000]}{thread_part}\n\n"
+        f"BODY: {(body or '')[:3000]}{thread_part}{profile_part}\n\n"
         "JSON (all fields required):\n"
         "{\n"
         "  \"intent\": \"support_request|refund_demand|sales_inquiry|meeting_request|complaint|spam|urgent_escalation|billing_question|partnership_offer|general_inquiry\",\n"
@@ -343,6 +380,30 @@ async def _llm_generate_email(system_prompt: str, user_prompt: str) -> str:
         return text or "Thank you for your email. I will follow up with details soon."
     except Exception:
         return "Thank you for your message. I will get back to you shortly."
+
+
+def _profile_system_context(profile: Optional[UserProfile]) -> str:
+    if not profile:
+        return ""
+    lines = [
+        "User Profile Context (follow unless it conflicts with user request):",
+        f"- Full name: {profile.full_name or ''}",
+        f"- Role title: {profile.role_title or ''}",
+        f"- Company: {profile.company_name or ''}",
+        f"- Preferred writing tone: {profile.writing_tone or 'professional'}",
+        f"- Preferred language: {profile.default_language or 'en'}",
+        f"- Signature to use when suitable: {profile.signature or ''}",
+    ]
+    if profile.custom_system_prompt:
+        lines.append(f"- Custom instruction: {profile.custom_system_prompt}")
+    return "\n".join(lines)
+
+
+def _merge_system_prompt(base_prompt: str, profile: Optional[UserProfile]) -> str:
+    profile_ctx = _profile_system_context(profile)
+    if not profile_ctx:
+        return base_prompt
+    return f"{base_prompt}\n\n{profile_ctx}"
 
 
 def _build_reply_prompt(data) -> tuple[str, str]:
@@ -866,6 +927,16 @@ class ImproveDraftIn(BaseModel):
     tone: Optional[str] = "professional"
     language: Optional[str] = "en"
 
+
+class ProfileIn(BaseModel):
+    full_name: Optional[str] = ""
+    role_title: Optional[str] = ""
+    company_name: Optional[str] = ""
+    writing_tone: Optional[str] = "professional"
+    signature: Optional[str] = ""
+    custom_system_prompt: Optional[str] = ""
+    default_language: Optional[str] = "en"
+
 # Section 10: Routes
 
 @app.get("/")
@@ -973,6 +1044,48 @@ async def auth_callback(code: str = "", db: AsyncSession = Depends(get_db)):
 @app.get("/auth/me")
 async def auth_me(user: User = Depends(auth)):
     return {"id": user.id, "email": user.email, "name": user.name, "picture": user.picture}
+
+
+@app.get("/profile")
+async def get_profile(user: User = Depends(auth), db: AsyncSession = Depends(get_db)):
+    profile = await _get_or_create_user_profile(db, user)
+    return {
+        "user_id": profile.user_id,
+        "full_name": profile.full_name or "",
+        "role_title": profile.role_title or "",
+        "company_name": profile.company_name or "",
+        "writing_tone": profile.writing_tone or "professional",
+        "signature": profile.signature or "",
+        "custom_system_prompt": profile.custom_system_prompt or "",
+        "default_language": profile.default_language or "en",
+    }
+
+
+@app.put("/profile")
+async def upsert_profile(data: ProfileIn, user: User = Depends(auth), db: AsyncSession = Depends(get_db)):
+    profile = await _get_or_create_user_profile(db, user)
+    profile.full_name = data.full_name or ""
+    profile.role_title = data.role_title or ""
+    profile.company_name = data.company_name or ""
+    profile.writing_tone = data.writing_tone or "professional"
+    profile.signature = data.signature or ""
+    profile.custom_system_prompt = data.custom_system_prompt or ""
+    profile.default_language = data.default_language or "en"
+    await db.commit()
+    await db.refresh(profile)
+    return {
+        "message": "Profile updated",
+        "profile": {
+            "user_id": profile.user_id,
+            "full_name": profile.full_name or "",
+            "role_title": profile.role_title or "",
+            "company_name": profile.company_name or "",
+            "writing_tone": profile.writing_tone or "professional",
+            "signature": profile.signature or "",
+            "custom_system_prompt": profile.custom_system_prompt or "",
+            "default_language": profile.default_language or "en",
+        },
+    }
 
 
 @app.post("/auth/logout")
@@ -1097,13 +1210,22 @@ async def sync_emails(
     if not raw_emails:
         return {"processed": 0, "skipped": 0, "errors": 0, "emails": [], "error_details": []}
 
+    profile = await _get_or_create_user_profile(db, user)
+    profile_ctx = _profile_system_context(profile)
+
     done, skipped, errors = [], [], []
     for raw in raw_emails:
         try:
             ctx = None
             if raw.get("thread_id") and raw.get("gmail_message_id"):
                 ctx = await _thread_context(user.access_token, raw["thread_id"], raw["gmail_message_id"]) or None
-            analysis = await ai_analyze(raw.get("subject", ""), raw.get("body", ""), raw.get("sender", ""), ctx)
+            analysis = await ai_analyze(
+                raw.get("subject", ""),
+                raw.get("body", ""),
+                raw.get("sender", ""),
+                ctx,
+                profile_ctx,
+            )
             saved = await save_email(db, user, raw, analysis)
             if saved is None:
                 skipped.append(raw.get("subject", "?"))
@@ -1145,7 +1267,14 @@ async def process_email(
     user: User = Depends(auth),
     db: AsyncSession = Depends(get_db),
 ):
-    analysis = await ai_analyze(data.subject, data.body, data.sender, data.thread_context)
+    profile = await _get_or_create_user_profile(db, user)
+    analysis = await ai_analyze(
+        data.subject,
+        data.body,
+        data.sender,
+        data.thread_context,
+        _profile_system_context(profile),
+    )
     raw = {
         "sender": data.sender,
         "subject": data.subject,
@@ -1168,9 +1297,11 @@ async def batch_emails(
     user: User = Depends(auth),
     db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
+    profile_ctx = _profile_system_context(profile)
     results = []
     for e in batch.emails:
-        analysis = await ai_analyze(e.subject, e.body, e.sender, e.thread_context)
+        analysis = await ai_analyze(e.subject, e.body, e.sender, e.thread_context, profile_ctx)
         raw = {
             "sender": e.sender,
             "subject": e.subject,
@@ -1272,8 +1403,11 @@ async def send_reply(
 async def generate_reply(
     data: GenerateReplyIn,
     user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_reply_prompt(data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     reply_body = await _llm_generate_email(system_prompt, user_prompt)
     return {
         "subject": f"Re: {data.subject}" if not data.subject.lower().startswith("re:") else data.subject,
@@ -1310,8 +1444,11 @@ async def send_email_direct(
 async def generate_email(
     data: GenerateEmailIn,
     user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_general_email_prompt(data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     return {"email_body": body, "model": AI_MODEL}
 
@@ -1320,8 +1457,11 @@ async def generate_email(
 async def generate_job_email(
     data: GenerateJobEmailIn,
     user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_job_email_prompt(data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     return {
         "to": data.recipient_email,
@@ -1335,8 +1475,11 @@ async def generate_job_email(
 async def generate_proposal_email(
     data: GenerateProposalIn,
     user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_proposal_prompt(data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     return {
         "to": data.customer_email,
@@ -1350,8 +1493,11 @@ async def generate_proposal_email(
 async def generate_follow_up_email(
     data: GenerateFollowUpIn,
     user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_followup_prompt(data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     return {
         "suggested_subject": "Quick follow-up",
@@ -1376,7 +1522,9 @@ async def generate_and_send_email(
         language=data.language,
         cta=data.cta,
     )
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_general_email_prompt(prompt_data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     sent = await _send_email_with_refresh(
         db,
@@ -1414,7 +1562,9 @@ async def job_apply_send(
         tone=data.tone,
         language=data.language,
     )
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_job_email_prompt(gen)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     sent = await _send_email_with_refresh(
         db,
@@ -1454,7 +1604,9 @@ async def proposal_send(
         tone=data.tone,
         language=data.language,
     )
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_proposal_prompt(gen)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     sent = await _send_email_with_refresh(
         db,
@@ -1479,8 +1631,11 @@ async def proposal_send(
 async def generate_subject_ideas(
     data: SubjectIdeasIn,
     user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_subjects_prompt(data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     raw = await _llm_generate_email(system_prompt, user_prompt)
     lines = [ln.strip("- ").strip() for ln in raw.splitlines() if ln.strip()]
     count = max(1, min(int(data.count or 5), 10))
@@ -1494,8 +1649,11 @@ async def generate_subject_ideas(
 async def improve_email_draft(
     data: ImproveDraftIn,
     user: User = Depends(auth),
+    db: AsyncSession = Depends(get_db),
 ):
+    profile = await _get_or_create_user_profile(db, user)
     system_prompt, user_prompt = _build_improve_prompt(data)
+    system_prompt = _merge_system_prompt(system_prompt, profile)
     body = await _llm_generate_email(system_prompt, user_prompt)
     return {"email_body": body, "model": AI_MODEL}
 
@@ -1648,6 +1806,8 @@ async def webhook_gmail(request: Request, db: AsyncSession = Depends(get_db)):
         return {"status": "ignored"}
 
     try:
+        profile = await _get_or_create_user_profile(db, user)
+        profile_ctx = _profile_system_context(profile)
         raw_emails = await _fetch_unread(user.access_token, 5)
         for raw_email in raw_emails:
             ctx = None
@@ -1658,6 +1818,7 @@ async def webhook_gmail(request: Request, db: AsyncSession = Depends(get_db)):
                 raw_email.get("body", ""),
                 raw_email.get("sender", ""),
                 ctx,
+                profile_ctx,
             )
             saved = await save_email(db, user, raw_email, analysis)
             if saved and raw_email.get("gmail_message_id"):
