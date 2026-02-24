@@ -50,15 +50,15 @@ In **Google Cloud Console → APIs & Services → Credentials → OAuth 2.0 Clie
 Add these to **Authorized redirect URIs:**
 
 ```
-https://06-mailbrain-api.vercel.app/auth/callback
+https://07-mailbrain-api.vercel.app/auth/callback
 http://localhost:8000/auth/callback
 ```
 
 Add these to **Authorized JavaScript origins:**
 
 ```
-https://06-mailbrain.vercel.app
-https://06-mailbrain-api.vercel.app
+https://07-mailbrain.vercel.app
+https://07-mailbrain-api.vercel.app
 http://localhost:3000
 http://localhost:8000
 ```

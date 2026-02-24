@@ -27,8 +27,8 @@ if load_dotenv:
 
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "https://06-mailbrain-api.vercel.app/auth/callback")
-FRONTEND_URL         = os.environ.get("FRONTEND_URL", "https://06-mailbrain.vercel.app")
+GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "https://07-mailbrain-api.vercel.app/auth/callback")
+FRONTEND_URL         = os.environ.get("FRONTEND_URL", "https://07-mailbrain.vercel.app")
 JWT_SECRET           = os.environ.get("JWT_SECRET", "dev-secret")
 JWT_ALGO             = "HS256"
 JWT_HOURS            = 24
