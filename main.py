@@ -405,7 +405,7 @@ async def _send_email(token, to, subject, body, thread_id=None) -> dict:
 
 async def _fetch_unread(token, max_results=20) -> list:
     data = await _gmail_get(token, "/users/me/messages",
-                            params={"q": "is:unread in:inbox -from:me",
+                            params={"q": "is:unread -from:me",
                                     "maxResults": max_results})
     msgs = data.get("messages", []) or []
     out = []
