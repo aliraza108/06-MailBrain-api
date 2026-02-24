@@ -685,10 +685,11 @@ async def _send_email_with_refresh(db: AsyncSession, user: User, to: str, subjec
 
 async def _fetch_inbox_messages(token, max_results=20, unread_only: bool = False, lookback_days: int = 10) -> list:
     days = max(1, min(int(lookback_days or 10), 30))
+    category_filter = "{category:primary category:updates} -category:promotions -category:social"
     query = (
-        "is:unread -from:me"
+        f"is:unread -from:me {category_filter}"
         if unread_only
-        else f"in:inbox -from:me newer_than:{days}d"
+        else f"in:inbox -from:me newer_than:{days}d {category_filter}"
     )
     data = await _gmail_get(token, "/users/me/messages",
                             params={"q": query,
