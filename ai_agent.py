@@ -1,189 +1,182 @@
 """
-MailBrain AI Agent
-Uses openai-agents SDK pointed at Gemini's OpenAI-compatible endpoint.
+MailBrain AI — Gemini analysis via direct REST calls.
+No openai/openai-agents SDK dependency.
+Always returns a result — falls back to rule-based if AI fails.
 """
-
 import json
 import re
-from typing import Optional
-from agents import Agent, Runner, set_default_openai_api, set_default_openai_client, set_tracing_disabled, AsyncOpenAI
-from config import get_settings
-
-settings = get_settings()
-
-# ──────────────────────────────────────────────
-# Configure Gemini as the AI backend
-# ──────────────────────────────────────────────
-client = AsyncOpenAI(
-    base_url=settings.AI_BASE_URL,
-    api_key=settings.GEMINI_API_KEY
-)
-set_default_openai_api("chat_completions")
-set_default_openai_client(client=client)
-set_tracing_disabled(True)
+import httpx
+from config import GEMINI_API_KEY, AI_MODEL, AI_BASE_URL
 
 
-# ──────────────────────────────────────────────
-# Tool Functions (called by the agent)
-# ──────────────────────────────────────────────
+_PROMPT = """\
+Analyze this email and return ONLY a JSON object. No explanation, no markdown, no backticks.
 
-def detect_intent(email_content: str) -> dict:
-    """
-    Analyze email and detect its primary intent.
-    Returns intent category and confidence.
-    """
-    # This is called as a tool by the agent — the agent fills it via reasoning
-    return {"status": "tool_called", "input": email_content}
+FROM: {sender}
+SUBJECT: {subject}
+BODY:
+{body}
+{thread_part}
 
-
-def score_priority(intent: str, tone_keywords: str, subject: str) -> dict:
-    """
-    Score email urgency based on intent, tone keywords found, and subject.
-    Returns priority level: CRITICAL | HIGH | NORMAL | LOW and numeric score 0-1.
-    """
-    return {"status": "tool_called", "intent": intent}
-
-
-def decide_action(intent: str, priority: str, confidence: float) -> dict:
-    """
-    Decide the best action for this email.
-    Actions: auto_reply | assign_department | create_ticket | schedule_meeting | flag_management | request_info
-    Returns action type and relevant parameters.
-    """
-    return {"status": "tool_called"}
-
-
-def generate_reply(intent: str, tone: str, original_email: str, sender_name: str) -> dict:
-    """
-    Generate a context-aware email reply.
-    Tone options: professional | empathetic | friendly | firm
-    Returns the complete reply text.
-    """
-    return {"status": "tool_called"}
-
-
-# ──────────────────────────────────────────────
-# The MailBrain Agent
-# ──────────────────────────────────────────────
-
-mailbrain_agent = Agent(
-    name="MailBrain Email Operations Agent",
-    instructions="""
-You are MailBrain, an autonomous email operations AI. Your job is to fully analyze incoming emails
-and produce a structured JSON analysis for each one.
-
-For every email you receive, you MUST:
-
-1. DETECT INTENT — Classify into exactly one of:
-   support_request | refund_demand | sales_inquiry | meeting_request | complaint |
-   spam | urgent_escalation | billing_question | partnership_offer | general_inquiry
-
-2. SCORE PRIORITY — Assign exactly one of:
-   CRITICAL (needs response <1h) | HIGH (needs response <4h) | NORMAL (<24h) | LOW (<72h)
-   Also output a numeric score from 0.0 to 1.0 (1.0 = most urgent)
-
-3. DETECT SENTIMENT — positive | neutral | negative
-
-4. DETECT LANGUAGE — ISO 639-1 code (e.g., "en", "es", "fr", "ar")
-
-5. DECIDE ACTION — Choose the best action:
-   auto_reply | assign_department | create_ticket | schedule_meeting | flag_management | request_info
-   Also specify department if assigning: support | billing | sales | management | technical
-
-6. GENERATE REPLY — Write a complete, ready-to-send email reply.
-   Choose tone based on context: professional | empathetic | friendly | firm
-   Reply in the SAME LANGUAGE as the original email.
-
-7. ASSESS CONFIDENCE — Your confidence in the analysis: 0.0 to 1.0
-
-8. SUMMARIZE — One sentence summary of what the email is about.
-
-9. ESCALATION RISK — Will this become a serious problem if not handled? true | false
-
-10. FOLLOW-UP NEEDED — Should a follow-up reminder be set? true | false, and when (hours from now).
-
-Output ONLY valid JSON in this exact format:
-{
-  "intent": "...",
-  "priority": "...",
-  "priority_score": 0.0,
-  "sentiment": "...",
-  "language": "...",
-  "summary": "...",
-  "action": "...",
-  "assigned_department": "...",
-  "confidence_score": 0.0,
+Required JSON (every field is mandatory):
+{{
+  "intent": "support_request|refund_demand|sales_inquiry|meeting_request|complaint|spam|urgent_escalation|billing_question|partnership_offer|general_inquiry",
+  "priority": "CRITICAL|HIGH|NORMAL|LOW",
+  "priority_score": 0.85,
+  "sentiment": "positive|neutral|negative",
+  "language": "en",
+  "summary": "One sentence summary.",
+  "action": "auto_reply|assign_department|create_ticket|schedule_meeting|flag_management|request_info",
+  "assigned_department": "support|billing|sales|management|technical|none",
+  "confidence_score": 0.90,
   "escalation_risk": false,
   "follow_up_needed": false,
   "follow_up_hours": null,
-  "reply_tone": "...",
-  "generated_reply": "...",
-  "keywords_detected": []
-}
-""",
-    model=settings.AI_MODEL,
-    tools=[detect_intent, score_priority, decide_action, generate_reply]
-)
+  "reply_tone": "professional|empathetic|friendly|firm",
+  "generated_reply": "Dear [Name],\\n\\nFull reply text here...\\n\\nBest regards,\\nSupport Team",
+  "keywords_detected": ["word1", "word2"]
+}}"""
 
 
-# ──────────────────────────────────────────────
-# Main Analysis Function
-# ──────────────────────────────────────────────
+def _fallback(subject: str, body: str) -> dict:
+    """Rule-based analysis used when Gemini is unavailable."""
+    text = (subject + " " + body).lower()
+
+    if any(w in text for w in ["urgent", "asap", "emergency", "immediately", "critical"]):
+        intent, priority, dept, score = "urgent_escalation", "CRITICAL", "management", 0.95
+    elif any(w in text for w in ["refund", "money back", "reimburse", "chargeback"]):
+        intent, priority, dept, score = "refund_demand", "HIGH", "billing", 0.80
+    elif any(w in text for w in ["complaint", "unacceptable", "terrible", "disgusting", "awful"]):
+        intent, priority, dept, score = "complaint", "HIGH", "support", 0.75
+    elif any(w in text for w in ["invoice", "billing", "payment", "subscription", "charge"]):
+        intent, priority, dept, score = "billing_question", "HIGH", "billing", 0.75
+    elif any(w in text for w in ["meeting", "schedule", "call", "demo", "appointment"]):
+        intent, priority, dept, score = "meeting_request", "NORMAL", "sales", 0.70
+    elif any(w in text for w in ["partner", "collaboration", "integrate", "api", "business"]):
+        intent, priority, dept, score = "partnership_offer", "LOW", "sales", 0.60
+    elif any(w in text for w in ["unsubscribe", "spam", "promotional", "offer"]):
+        intent, priority, dept, score = "spam", "LOW", "none", 0.50
+    elif any(w in text for w in ["bug", "error", "broken", "not working", "issue"]):
+        intent, priority, dept, score = "support_request", "HIGH", "technical", 0.75
+    else:
+        intent, priority, dept, score = "general_inquiry", "NORMAL", "support", 0.60
+
+    negative_words = ["angry", "furious", "terrible", "awful", "hate", "worst", "disgusting"]
+    sentiment = "negative" if any(w in text for w in negative_words) else "neutral"
+
+    return {
+        "intent":              intent,
+        "priority":            priority,
+        "priority_score":      score,
+        "sentiment":           sentiment,
+        "language":            "en",
+        "summary":             f"Email about: {subject[:100]}",
+        "action":              "assign_department",
+        "assigned_department": dept,
+        "confidence_score":    0.60,
+        "escalation_risk":     priority in ("CRITICAL", "HIGH"),
+        "follow_up_needed":    priority == "CRITICAL",
+        "follow_up_hours":     2 if priority == "CRITICAL" else None,
+        "reply_tone":          "empathetic" if sentiment == "negative" else "professional",
+        "generated_reply": (
+            f"Dear Customer,\n\nThank you for contacting us regarding \"{subject}\".\n"
+            f"We have received your message and our {dept} team will respond within 24 hours.\n\n"
+            f"Best regards,\nMailBrain Support Team"
+        ),
+        "keywords_detected": [],
+    }
+
+
+def _clean_json(raw: str) -> str:
+    """Strip markdown fences and whitespace from AI output."""
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return raw.strip()
+
+
+def _fill_defaults(data: dict) -> dict:
+    """Ensure every required key exists."""
+    defaults = {
+        "intent": "general_inquiry",
+        "priority": "NORMAL",
+        "priority_score": 0.5,
+        "sentiment": "neutral",
+        "language": "en",
+        "summary": "Email received.",
+        "action": "auto_reply",
+        "assigned_department": "support",
+        "confidence_score": 0.7,
+        "escalation_risk": False,
+        "follow_up_needed": False,
+        "follow_up_hours": None,
+        "reply_tone": "professional",
+        "generated_reply": "Thank you for your email. We will respond shortly.",
+        "keywords_detected": [],
+    }
+    for k, v in defaults.items():
+        if k not in data or data[k] is None:
+            data[k] = v
+    return data
+
 
 async def analyze_email(
     subject: str,
     body: str,
     sender: str,
-    sender_name: str = "",
-    thread_context: Optional[str] = None
+    thread_context: str = None,
 ) -> dict:
     """
-    Run the MailBrain agent on a single email.
-    Returns structured analysis dict.
+    Analyze an email with Gemini AI.
+    Always returns {"success": bool, "data": {...}}.
+    Never raises — falls back gracefully.
     """
-    prompt = f"""
-Analyze this email completely:
+    if not GEMINI_API_KEY:
+        return {"success": False, "error": "No GEMINI_API_KEY", "data": _fallback(subject, body)}
 
-FROM: {sender} ({sender_name or 'Unknown'})
-SUBJECT: {subject}
-BODY:
-{body}
-"""
-    if thread_context:
-        prompt += f"\n\nPREVIOUS THREAD CONTEXT:\n{thread_context}"
+    thread_part = f"\nPREVIOUS THREAD:\n{thread_context[:600]}" if thread_context else ""
+    prompt = _PROMPT.format(
+        sender=sender or "unknown@email.com",
+        subject=subject or "(no subject)",
+        body=(body or "")[:3000],
+        thread_part=thread_part,
+    )
 
     try:
-        result = await Runner.run(mailbrain_agent, input=prompt)
-        output = result.final_output.strip()
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            resp = await client.post(
+                f"{AI_BASE_URL}chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GEMINI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model":       AI_MODEL,
+                    "max_tokens":  2048,
+                    "temperature": 0.1,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are MailBrain. Return ONLY valid JSON. No markdown. No explanations.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+            )
+            resp.raise_for_status()
 
-        # Strip markdown code fences if present
-        output = re.sub(r"^```json\s*", "", output)
-        output = re.sub(r"\s*```$", "", output)
+        content = resp.json()["choices"][0]["message"]["content"]
+        cleaned = _clean_json(content)
+        parsed  = json.loads(cleaned)
+        data    = _fill_defaults(parsed)
+        return {"success": True, "data": data}
 
-        analysis = json.loads(output)
-        return {"success": True, "data": analysis}
-
-    except json.JSONDecodeError as e:
-        return {
-            "success": False,
-            "error": f"JSON parse error: {str(e)}",
-            "raw": result.final_output if 'result' in dir() else ""
-        }
+    except json.JSONDecodeError:
+        # AI returned non-JSON — use fallback but mark partial success
+        return {"success": False, "error": "invalid_json", "data": _fallback(subject, body)}
+    except httpx.HTTPStatusError as e:
+        return {"success": False, "error": f"gemini_http_{e.response.status_code}", "data": _fallback(subject, body)}
+    except httpx.TimeoutException:
+        return {"success": False, "error": "gemini_timeout", "data": _fallback(subject, body)}
     except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-async def analyze_batch(emails: list[dict]) -> list[dict]:
-    """Analyze multiple emails concurrently."""
-    import asyncio
-    tasks = [
-        analyze_email(
-            subject=e.get("subject", ""),
-            body=e.get("body", ""),
-            sender=e.get("sender", ""),
-            sender_name=e.get("sender_name", ""),
-            thread_context=e.get("thread_context")
-        )
-        for e in emails
-    ]
-    return await asyncio.gather(*tasks)
+        return {"success": False, "error": str(e), "data": _fallback(subject, body)}

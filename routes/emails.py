@@ -1,202 +1,117 @@
 import uuid
-import httpx
-import base64
-import json
-import re
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends, Header
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select, func, desc
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db, User, Email, ActivityLog
-from config import GEMINI_API_KEY, AI_MODEL, AI_BASE_URL, AUTO_SEND_THRESHOLD
-from routes.auth import verify_jwt
+from ai_agent import analyze_email
+from config import AUTO_SEND_THRESHOLD
+from database import ActivityLog, EmailRecord, User, get_db
+from gmail_service import GmailService
+from routes.auth import decode_token
 
 router = APIRouter()
 
-GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
 
+# ── Auth dependency ───────────────────────────────────────────────────────────
 
-# ── Auth helper ────────────────────────────────────────────────────────────────
-
-async def get_current_user(authorization: str = Header(None), db: AsyncSession = Depends(get_db)):
+async def require_user(
+    authorization: str = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> User:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization required")
-    payload = verify_jwt(authorization.replace("Bearer ", ""))
-    result = await db.execute(select(User).where(User.id == payload["sub"]))
-    user = result.scalar_one_or_none()
+        raise HTTPException(401, "Missing Authorization: Bearer <token>")
+    payload = decode_token(authorization[7:].strip())
+    result  = await db.execute(select(User).where(User.id == payload["sub"]))
+    user    = result.scalar_one_or_none()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(404, "User not found")
     return user
 
 
-# ── Schemas ────────────────────────────────────────────────────────────────────
+# ── Schemas ───────────────────────────────────────────────────────────────────
 
-class ManualEmailInput(BaseModel):
-    sender: str
-    sender_name: Optional[str] = ""
-    subject: str
-    body: str
+class EmailInput(BaseModel):
+    sender:         str
+    sender_name:    Optional[str] = ""
+    subject:        str
+    body:           str
     thread_context: Optional[str] = None
 
-class BatchInput(BaseModel):
-    emails: list[ManualEmailInput]
 
-class ReplyInput(BaseModel):
+class BatchIn(BaseModel):
+    emails: list[EmailInput]
+
+
+class ReplyIn(BaseModel):
     body: str
 
 
-# ── Gmail helpers ──────────────────────────────────────────────────────────────
+# ── Core: save analysis to DB ─────────────────────────────────────────────────
 
-def extract_body(payload: dict) -> str:
-    mime = payload.get("mimeType", "")
-    if mime == "text/plain":
-        data = payload.get("body", {}).get("data", "")
-        if data:
-            return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
-    if mime.startswith("multipart/"):
-        for part in payload.get("parts", []):
-            body = extract_body(part)
-            if body:
-                return body
-    return ""
-
-
-def parse_message(raw: dict) -> dict:
-    import email as email_lib
-    headers = {h["name"].lower(): h["value"] for h in raw.get("payload", {}).get("headers", [])}
-    try:
-        received_at = email_lib.utils.parsedate_to_datetime(headers.get("date", ""))
-    except Exception:
-        received_at = datetime.utcnow()
-    return {
-        "gmail_message_id": raw.get("id"),
-        "thread_id": raw.get("threadId"),
-        "sender": headers.get("from", ""),
-        "recipient": headers.get("to", ""),
-        "subject": headers.get("subject", "(no subject)"),
-        "body": extract_body(raw.get("payload", {})),
-        "received_at": received_at,
-        "raw_headers": dict(headers),
-    }
-
-
-async def gmail_request(access_token: str, path: str, params: dict = None) -> dict:
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{GMAIL_API}{path}",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params=params or {},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-async def gmail_send(access_token: str, to: str, subject: str, body: str, thread_id: str = None):
-    from email.mime.text import MIMEText
-    msg = MIMEText(body)
-    msg["to"] = to
-    msg["subject"] = subject if subject.startswith("Re:") else f"Re: {subject}"
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-    payload = {"raw": raw}
-    if thread_id:
-        payload["threadId"] = thread_id
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{GMAIL_API}/users/me/messages/send",
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-# ── AI Analysis ────────────────────────────────────────────────────────────────
-
-async def analyze_email(subject: str, body: str, sender: str, thread_context: str = None) -> dict:
-    prompt = f"""Analyze this email and respond ONLY with valid JSON. No markdown, no backticks, just JSON.
-
-FROM: {sender}
-SUBJECT: {subject}
-BODY:
-{body[:3000]}
-{"THREAD CONTEXT:\\n" + thread_context[:1000] if thread_context else ""}
-
-Return this exact JSON:
-{{
-  "intent": "support_request|refund_demand|sales_inquiry|meeting_request|complaint|spam|urgent_escalation|billing_question|partnership_offer|general_inquiry",
-  "priority": "CRITICAL|HIGH|NORMAL|LOW",
-  "priority_score": 0.8,
-  "sentiment": "positive|neutral|negative",
-  "language": "en",
-  "summary": "one sentence",
-  "action": "auto_reply|assign_department|create_ticket|schedule_meeting|flag_management|request_info",
-  "assigned_department": "support|billing|sales|management|technical|null",
-  "confidence_score": 0.9,
-  "escalation_risk": false,
-  "follow_up_needed": false,
-  "follow_up_hours": null,
-  "reply_tone": "professional|empathetic|friendly|firm",
-  "generated_reply": "Dear ..., full reply text here",
-  "keywords_detected": ["keyword1", "keyword2"]
-}}"""
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{AI_BASE_URL}chat/completions",
-                headers={"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"},
-                json={"model": AI_MODEL, "max_tokens": 2000, "messages": [{"role": "user", "content": prompt}]},
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
-            content = re.sub(r"^```json\s*", "", content)
-            content = re.sub(r"^```\s*", "", content)
-            content = re.sub(r"\s*```$", "", content)
-            return {"success": True, "data": json.loads(content)}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-# ── Save to DB ─────────────────────────────────────────────────────────────────
-
-async def save_email_record(db: AsyncSession, user: User, raw: dict, analysis: dict) -> Email:
+async def save_email_to_db(
+    db:       AsyncSession,
+    user:     User,
+    raw:      dict,
+    analysis: dict,
+) -> EmailRecord:
+    """
+    Save an AI-analysed email to the database.
+    Auto-sends reply if confidence >= threshold and action is auto_reply.
+    Skips duplicate gmail_message_id.
+    """
     d = analysis.get("data", {})
+
+    # Skip duplicates (same Gmail message already processed)
+    gmail_id = raw.get("gmail_message_id")
+    if gmail_id:
+        existing = await db.execute(
+            select(EmailRecord).where(EmailRecord.gmail_message_id == gmail_id)
+        )
+        if existing.scalar_one_or_none():
+            return None  # Already processed
+
+    # Compute follow-up time
     follow_up_at = None
     if d.get("follow_up_needed") and d.get("follow_up_hours"):
         follow_up_at = datetime.utcnow() + timedelta(hours=float(d["follow_up_hours"]))
 
-    record = Email(
-        id=str(uuid.uuid4()),
-        user_id=user.id,
-        gmail_message_id=raw.get("gmail_message_id"),
-        thread_id=raw.get("thread_id"),
-        sender=raw.get("sender", ""),
-        recipient=raw.get("recipient", ""),
-        subject=raw.get("subject", ""),
-        body=raw.get("body", ""),
-        received_at=raw.get("received_at"),
-        intent=d.get("intent"),
-        priority=d.get("priority"),
-        priority_score=d.get("priority_score"),
-        sentiment=d.get("sentiment"),
-        language=d.get("language", "en"),
-        summary=d.get("summary"),
-        action_taken=d.get("action"),
-        assigned_department=d.get("assigned_department"),
-        confidence_score=d.get("confidence_score"),
-        generated_reply=d.get("generated_reply"),
-        escalated=d.get("escalation_risk", False),
-        follow_up_at=follow_up_at,
-        ai_metadata={"keywords": d.get("keywords_detected", []), "tone": d.get("reply_tone")},
-        raw_headers=raw.get("raw_headers", {}),
-        status="processed",
+    record = EmailRecord(
+        id                  = str(uuid.uuid4()),
+        user_id             = user.id,
+        gmail_message_id    = gmail_id,
+        thread_id           = raw.get("thread_id"),
+        sender              = raw.get("sender", ""),
+        recipient           = raw.get("recipient", ""),
+        subject             = raw.get("subject", ""),
+        body                = raw.get("body", ""),
+        received_at         = raw.get("received_at"),
+        intent              = d.get("intent"),
+        priority            = d.get("priority"),
+        priority_score      = d.get("priority_score"),
+        sentiment           = d.get("sentiment"),
+        language            = d.get("language", "en"),
+        summary             = d.get("summary"),
+        action_taken        = d.get("action"),
+        assigned_department = d.get("assigned_department"),
+        confidence_score    = d.get("confidence_score"),
+        generated_reply     = d.get("generated_reply"),
+        escalated           = bool(d.get("escalation_risk", False)),
+        follow_up_at        = follow_up_at,
+        ai_metadata         = {
+            "keywords":    d.get("keywords_detected", []),
+            "tone":        d.get("reply_tone"),
+            "ai_success":  analysis.get("success", False),
+            "ai_error":    analysis.get("error"),
+        },
+        raw_headers         = raw.get("raw_headers", {}),
+        status              = "processed",
     )
 
-    # Auto-send if confident enough
+    # Auto-send reply if confidence is high enough
     if (
         d.get("action") == "auto_reply"
         and float(d.get("confidence_score") or 0) >= AUTO_SEND_THRESHOLD
@@ -204,179 +119,319 @@ async def save_email_record(db: AsyncSession, user: User, raw: dict, analysis: d
         and raw.get("sender")
     ):
         try:
-            await gmail_send(user.access_token, raw["sender"], raw.get("subject", ""),
-                             d.get("generated_reply", ""), raw.get("thread_id"))
+            gmail = GmailService(user.access_token)
+            await gmail.send_reply(
+                to        = raw["sender"],
+                subject   = raw.get("subject", ""),
+                body      = d.get("generated_reply", ""),
+                thread_id = raw.get("thread_id"),
+            )
             record.reply_sent    = True
             record.reply_sent_at = datetime.utcnow()
         except Exception as e:
-            record.status = f"reply_failed: {str(e)[:100]}"
+            record.status = f"reply_failed: {str(e)[:120]}"
 
     db.add(record)
     db.add(ActivityLog(
-        user_id=user.id, email_id=record.id, action=d.get("action", "processed"),
-        details={"intent": d.get("intent"), "priority": d.get("priority"), "auto_sent": record.reply_sent}
+        user_id  = user.id,
+        email_id = record.id,
+        action   = d.get("action", "processed"),
+        details  = {
+            "intent":     d.get("intent"),
+            "priority":   d.get("priority"),
+            "confidence": d.get("confidence_score"),
+            "auto_sent":  record.reply_sent,
+            "ai_success": analysis.get("success"),
+        },
     ))
+
     await db.commit()
     await db.refresh(record)
     return record
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/")
 async def list_emails(
-    page: int = 1, page_size: int = 20,
-    intent: Optional[str] = None,
-    priority: Optional[str] = None,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    page:      int           = 1,
+    page_size: int           = 20,
+    intent:    Optional[str] = None,
+    priority:  Optional[str] = None,
+    user:      User          = Depends(require_user),
+    db:        AsyncSession  = Depends(get_db),
 ):
-    q = select(Email).where(Email.user_id == user.id).order_by(desc(Email.processed_at))
-    if intent:   q = q.where(Email.intent == intent)
-    if priority: q = q.where(Email.priority == priority)
+    q = (
+        select(EmailRecord)
+        .where(EmailRecord.user_id == user.id)
+        .order_by(desc(EmailRecord.processed_at))
+    )
+    if intent:   q = q.where(EmailRecord.intent == intent)
+    if priority: q = q.where(EmailRecord.priority == priority)
 
-    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar()
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
     rows  = (await db.execute(q.offset((page - 1) * page_size).limit(page_size))).scalars().all()
 
     return {
-        "total": total, "page": page, "page_size": page_size,
+        "total":     total,
+        "page":      page,
+        "page_size": page_size,
         "emails": [{
-            "id": e.id, "sender": e.sender, "subject": e.subject, "summary": e.summary,
-            "intent": e.intent, "priority": e.priority, "priority_score": e.priority_score,
-            "sentiment": e.sentiment, "action_taken": e.action_taken,
-            "confidence_score": e.confidence_score, "reply_sent": e.reply_sent,
-            "escalated": e.escalated, "received_at": str(e.received_at),
-            "processed_at": str(e.processed_at), "status": e.status,
+            "id":               e.id,
+            "sender":           e.sender,
+            "subject":          e.subject,
+            "summary":          e.summary,
+            "intent":           e.intent,
+            "priority":         e.priority,
+            "priority_score":   e.priority_score,
+            "sentiment":        e.sentiment,
+            "action_taken":     e.action_taken,
+            "assigned_department": e.assigned_department,
+            "confidence_score": e.confidence_score,
+            "reply_sent":       e.reply_sent,
+            "escalated":        e.escalated,
+            "received_at":      str(e.received_at),
+            "processed_at":     str(e.processed_at),
+            "status":           e.status,
         } for e in rows],
     }
 
 
 @router.post("/sync")
-async def sync_emails(
-    max_results: int = 20,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+async def sync_gmail(
+    max_results: int          = 20,
+    user:        User         = Depends(require_user),
+    db:          AsyncSession = Depends(get_db),
 ):
+    """
+    Pull unread Gmail messages, run AI analysis on each,
+    save to database, mark as read.
+    """
     if not user.access_token:
-        raise HTTPException(status_code=400, detail="No Gmail token. Please reconnect Gmail.")
+        raise HTTPException(400, "No Gmail token. Visit /auth/google to reconnect.")
+
+    gmail = GmailService(user.access_token)
+
+    # Fetch unread emails
     try:
-        data = await gmail_request(user.access_token, "/users/me/messages",
-                                   {"maxResults": max_results, "q": "is:unread -from:me"})
+        raw_emails = await gmail.fetch_and_parse_unread(max_results)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Gmail fetch failed: {str(e)}")
+        raise HTTPException(400, f"Gmail fetch failed: {str(e)}")
 
-    messages = data.get("messages", [])
-    if not messages:
-        return {"message": "No new emails", "processed": 0}
+    if not raw_emails:
+        return {"message": "No unread emails found", "processed": 0, "emails": []}
 
-    processed, errors = [], []
-    for msg_ref in messages:
+    processed, skipped, errors = [], [], []
+
+    for raw in raw_emails:
         try:
-            raw_msg  = await gmail_request(user.access_token, f"/users/me/messages/{msg_ref['id']}", {"format": "full"})
-            parsed   = parse_message(raw_msg)
-            analysis = await analyze_email(parsed["subject"], parsed["body"], parsed["sender"])
-            if analysis["success"]:
-                saved = await save_email_record(db, user, parsed, analysis)
-                processed.append({"id": saved.id, "subject": saved.subject, "intent": saved.intent, "priority": saved.priority})
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(f"{GMAIL_API}/users/me/messages/{msg_ref['id']}/modify",
-                                      headers={"Authorization": f"Bearer {user.access_token}"},
-                                      json={"removeLabelIds": ["UNREAD"]})
-            else:
-                errors.append({"error": analysis.get("error")})
-        except Exception as e:
-            errors.append({"error": str(e)})
+            # Get thread context for better AI understanding
+            thread_ctx = None
+            if raw.get("thread_id") and raw.get("gmail_message_id"):
+                thread_ctx = await gmail.get_thread_context(
+                    raw["thread_id"], raw["gmail_message_id"]
+                ) or None
 
-    return {"processed": len(processed), "errors": len(errors), "emails": processed}
+            # Run AI analysis
+            analysis = await analyze_email(
+                subject        = raw.get("subject", ""),
+                body           = raw.get("body", ""),
+                sender         = raw.get("sender", ""),
+                thread_context = thread_ctx,
+            )
+
+            # Save to DB
+            saved = await save_email_to_db(db, user, raw, analysis)
+
+            if saved is None:
+                skipped.append(raw.get("subject", "?"))
+                continue
+
+            processed.append({
+                "id":         saved.id,
+                "subject":    saved.subject,
+                "sender":     saved.sender,
+                "intent":     saved.intent,
+                "priority":   saved.priority,
+                "action":     saved.action_taken,
+                "reply_sent": saved.reply_sent,
+                "ai_success": analysis.get("success"),
+            })
+
+            # Mark as read in Gmail
+            if raw.get("gmail_message_id"):
+                await gmail.mark_as_read(raw["gmail_message_id"])
+
+        except Exception as e:
+            errors.append({
+                "subject": raw.get("subject", "?"),
+                "error":   str(e),
+            })
+
+    return {
+        "processed": len(processed),
+        "skipped":   len(skipped),
+        "errors":    len(errors),
+        "emails":    processed,
+        "error_details": errors,
+    }
 
 
 @router.post("/process")
-async def process_email(
-    data: ManualEmailInput,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+async def process_manual(
+    data: EmailInput,
+    user: User         = Depends(require_user),
+    db:   AsyncSession = Depends(get_db),
 ):
-    analysis = await analyze_email(data.subject, data.body, data.sender, data.thread_context)
-    if not analysis["success"]:
-        raise HTTPException(status_code=500, detail=f"AI error: {analysis.get('error')}")
-    raw = {"sender": data.sender, "subject": data.subject, "body": data.body,
-           "received_at": datetime.utcnow(), "raw_headers": {}}
-    saved = await save_email_record(db, user, raw, analysis)
-    return {"id": saved.id, "analysis": analysis["data"], "reply_sent": saved.reply_sent}
+    """Manually submit an email for AI analysis and save result."""
+    analysis = await analyze_email(
+        subject        = data.subject,
+        body           = data.body,
+        sender         = data.sender,
+        thread_context = data.thread_context,
+    )
+    raw = {
+        "sender":      data.sender,
+        "subject":     data.subject,
+        "body":        data.body,
+        "received_at": datetime.utcnow(),
+        "raw_headers": {},
+    }
+    saved = await save_email_to_db(db, user, raw, analysis)
+    return {
+        "id":         saved.id,
+        "analysis":   analysis["data"],
+        "reply_sent": saved.reply_sent,
+        "status":     saved.status,
+        "ai_success": analysis.get("success"),
+    }
 
 
 @router.post("/batch")
 async def batch_process(
-    batch: BatchInput,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    batch: BatchIn,
+    user:  User         = Depends(require_user),
+    db:    AsyncSession = Depends(get_db),
 ):
+    """Process a batch of emails at once."""
     results = []
     for e in batch.emails:
         analysis = await analyze_email(e.subject, e.body, e.sender, e.thread_context)
-        if analysis["success"]:
-            raw = {"sender": e.sender, "subject": e.subject, "body": e.body,
-                   "received_at": datetime.utcnow(), "raw_headers": {}}
-            saved = await save_email_record(db, user, raw, analysis)
-            results.append({"id": saved.id, "intent": saved.intent, "priority": saved.priority})
+        raw = {
+            "sender":      e.sender,
+            "subject":     e.subject,
+            "body":        e.body,
+            "received_at": datetime.utcnow(),
+            "raw_headers": {},
+        }
+        saved = await save_email_to_db(db, user, raw, analysis)
+        if saved:
+            results.append({
+                "id":       saved.id,
+                "intent":   saved.intent,
+                "priority": saved.priority,
+            })
     return {"processed": len(results), "emails": results}
 
 
 @router.get("/{email_id}")
 async def get_email(
     email_id: str,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    user:     User         = Depends(require_user),
+    db:       AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Email).where(Email.id == email_id, Email.user_id == user.id))
-    email = result.scalar_one_or_none()
-    if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
+    result = await db.execute(
+        select(EmailRecord).where(
+            EmailRecord.id      == email_id,
+            EmailRecord.user_id == user.id,
+        )
+    )
+    e = result.scalar_one_or_none()
+    if not e:
+        raise HTTPException(404, "Email not found")
     return {
-        "id": email.id, "sender": email.sender, "recipient": email.recipient,
-        "subject": email.subject, "body": email.body, "received_at": str(email.received_at),
-        "intent": email.intent, "priority": email.priority, "priority_score": email.priority_score,
-        "sentiment": email.sentiment, "language": email.language, "summary": email.summary,
-        "action_taken": email.action_taken, "assigned_department": email.assigned_department,
-        "confidence_score": email.confidence_score, "generated_reply": email.generated_reply,
-        "reply_sent": email.reply_sent, "reply_sent_at": str(email.reply_sent_at),
-        "escalated": email.escalated, "ai_metadata": email.ai_metadata, "status": email.status,
+        "id":                  e.id,
+        "sender":              e.sender,
+        "recipient":           e.recipient,
+        "subject":             e.subject,
+        "body":                e.body,
+        "received_at":         str(e.received_at),
+        "intent":              e.intent,
+        "priority":            e.priority,
+        "priority_score":      e.priority_score,
+        "sentiment":           e.sentiment,
+        "language":            e.language,
+        "summary":             e.summary,
+        "action_taken":        e.action_taken,
+        "assigned_department": e.assigned_department,
+        "confidence_score":    e.confidence_score,
+        "generated_reply":     e.generated_reply,
+        "reply_sent":          e.reply_sent,
+        "reply_sent_at":       str(e.reply_sent_at),
+        "escalated":           e.escalated,
+        "follow_up_at":        str(e.follow_up_at),
+        "ai_metadata":         e.ai_metadata,
+        "status":              e.status,
     }
 
 
 @router.post("/{email_id}/approve")
 async def approve_reply(
     email_id: str,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    user:     User         = Depends(require_user),
+    db:       AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Email).where(Email.id == email_id, Email.user_id == user.id))
-    email = result.scalar_one_or_none()
-    if not email:          raise HTTPException(status_code=404, detail="Email not found")
-    if email.reply_sent:   raise HTTPException(status_code=400, detail="Reply already sent")
-    if not email.generated_reply: raise HTTPException(status_code=400, detail="No generated reply")
+    """Send the AI-generated reply for an email."""
+    result = await db.execute(
+        select(EmailRecord).where(
+            EmailRecord.id      == email_id,
+            EmailRecord.user_id == user.id,
+        )
+    )
+    e = result.scalar_one_or_none()
+    if not e:
+        raise HTTPException(404, "Email not found")
+    if e.reply_sent:
+        raise HTTPException(400, "Reply already sent")
+    if not e.generated_reply:
+        raise HTTPException(400, "No AI reply available — process the email first")
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token — reconnect at /auth/google")
 
-    await gmail_send(user.access_token, email.sender, email.subject, email.generated_reply, email.thread_id)
-    email.reply_sent    = True
-    email.reply_sent_at = datetime.utcnow()
+    gmail = GmailService(user.access_token)
+    await gmail.send_reply(e.sender, e.subject, e.generated_reply, e.thread_id)
+
+    e.reply_sent    = True
+    e.reply_sent_at = datetime.utcnow()
     await db.commit()
-    return {"message": "Reply sent", "email_id": email_id}
+    return {"message": "Reply sent successfully", "email_id": email_id}
 
 
 @router.post("/{email_id}/reply")
-async def send_reply(
+async def send_custom_reply(
     email_id: str,
-    reply: ReplyInput,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    reply:    ReplyIn,
+    user:     User         = Depends(require_user),
+    db:       AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Email).where(Email.id == email_id, Email.user_id == user.id))
-    email = result.scalar_one_or_none()
-    if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
-    await gmail_send(user.access_token, email.sender, email.subject, reply.body, email.thread_id)
-    email.reply_sent      = True
-    email.reply_sent_at   = datetime.utcnow()
-    email.generated_reply = reply.body
+    """Send a custom reply for an email."""
+    result = await db.execute(
+        select(EmailRecord).where(
+            EmailRecord.id      == email_id,
+            EmailRecord.user_id == user.id,
+        )
+    )
+    e = result.scalar_one_or_none()
+    if not e:
+        raise HTTPException(404, "Email not found")
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token — reconnect at /auth/google")
+
+    gmail = GmailService(user.access_token)
+    await gmail.send_reply(e.sender, e.subject, reply.body, e.thread_id)
+
+    e.reply_sent      = True
+    e.reply_sent_at   = datetime.utcnow()
+    e.generated_reply = reply.body
     await db.commit()
     return {"message": "Reply sent", "email_id": email_id}

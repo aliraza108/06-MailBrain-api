@@ -1,137 +1,154 @@
 import uuid
-import httpx
-import jwt
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, Depends
+import httpx
+import jwt
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import RedirectResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db, User
 from config import (
-    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI,
-    FRONTEND_URL, JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRE_HOURS, GMAIL_SCOPES
+    GOOGLE_AUTH_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+    GOOGLE_REDIRECT_URI, GOOGLE_TOKEN_URL, GOOGLE_USER_URL,
+    FRONTEND_URL, GMAIL_SCOPES,
+    JWT_ALGORITHM, JWT_EXPIRE_HOURS, JWT_SECRET,
 )
+from database import User, get_db
 
 router = APIRouter()
 
-GOOGLE_AUTH_URL  = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_USER_URL  = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+# ── JWT ───────────────────────────────────────────────────────────────────────
+
+def create_token(user_id: str, email: str) -> str:
+    return jwt.encode(
+        {
+            "sub":   user_id,
+            "email": email,
+            "exp":   datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
+            "iat":   datetime.utcnow(),
+        },
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
 
 
-def create_jwt(user_id: str, email: str) -> str:
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
-        "iat": datetime.utcnow(),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
-def verify_jwt(token: str) -> dict:
+def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(401, "Token expired — please login again")
+    except Exception:
+        raise HTTPException(401, "Invalid token")
 
 
-async def get_current_user(authorization: str = None, db: AsyncSession = Depends(get_db)):
-    from fastapi import Header
+# ── Reusable dependency ───────────────────────────────────────────────────────
+
+async def require_user(
+    authorization: str = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> User:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    payload = verify_jwt(authorization.replace("Bearer ", ""))
-    result = await db.execute(select(User).where(User.id == payload["sub"]))
-    user = result.scalar_one_or_none()
+        raise HTTPException(401, "Missing Authorization: Bearer <token>")
+    payload = decode_token(authorization[7:].strip())
+    result  = await db.execute(select(User).where(User.id == payload["sub"]))
+    user    = result.scalar_one_or_none()
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(404, "User not found — please login again")
     return user
 
 
-@router.get("/google")
-async def google_login():
-    scopes = "%20".join(GMAIL_SCOPES)
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@router.get("/google", summary="Redirect to Google OAuth")
+async def login():
+    """Start the Google OAuth2 flow."""
     url = (
         f"{GOOGLE_AUTH_URL}"
         f"?client_id={GOOGLE_CLIENT_ID}"
         f"&redirect_uri={GOOGLE_REDIRECT_URI}"
         f"&response_type=code"
-        f"&scope={scopes}"
+        f"&scope={GMAIL_SCOPES.replace(' ', '%20')}"
         f"&access_type=offline"
         f"&prompt=consent"
     )
-    return RedirectResponse(url)
+    return RedirectResponse(url=url, status_code=302)
 
 
-@router.get("/callback")
-async def google_callback(code: str, db: AsyncSession = Depends(get_db)):
+@router.get("/callback", summary="Google OAuth callback")
+async def callback(code: str, db: AsyncSession = Depends(get_db)):
+    """
+    Google redirects here with ?code=...
+    Exchange for tokens → upsert user → issue JWT → redirect to frontend.
+    """
     async with httpx.AsyncClient(timeout=30) as client:
-        token_resp = await client.post(GOOGLE_TOKEN_URL, data={
-            "code": code,
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": GOOGLE_REDIRECT_URI,
-            "grant_type": "authorization_code",
-        })
+        # 1. Exchange auth code for access/refresh tokens
+        tok = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "code":          code,
+                "client_id":     GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri":  GOOGLE_REDIRECT_URI,
+                "grant_type":    "authorization_code",
+            },
+        )
+        if tok.status_code != 200:
+            raise HTTPException(400, f"Token exchange failed: {tok.text[:300]}")
+        tokens = tok.json()
 
-        if token_resp.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Token exchange failed: {token_resp.text}")
-
-        tokens = token_resp.json()
-
-        user_resp = await client.get(
+        # 2. Fetch Google profile
+        prof = await client.get(
             GOOGLE_USER_URL,
             headers={"Authorization": f"Bearer {tokens['access_token']}"},
         )
-        user_info = user_resp.json()
+        profile = prof.json()
 
-    # Upsert user
-    result = await db.execute(select(User).where(User.email == user_info["email"]))
-    user = result.scalar_one_or_none()
+    # 3. Upsert user
+    result = await db.execute(select(User).where(User.email == profile["email"]))
+    user   = result.scalar_one_or_none()
     expiry = datetime.utcnow() + timedelta(seconds=tokens.get("expires_in", 3600))
 
-    if not user:
+    if user:
+        user.access_token  = tokens["access_token"]
+        user.refresh_token = tokens.get("refresh_token", user.refresh_token)
+        user.token_expiry  = expiry
+        user.name          = profile.get("name")
+        user.picture       = profile.get("picture")
+    else:
         user = User(
             id=str(uuid.uuid4()),
-            email=user_info["email"],
-            name=user_info.get("name"),
-            picture=user_info.get("picture"),
-            access_token=tokens.get("access_token"),
+            email=profile["email"],
+            name=profile.get("name"),
+            picture=profile.get("picture"),
+            access_token=tokens["access_token"],
             refresh_token=tokens.get("refresh_token"),
             token_expiry=expiry,
         )
         db.add(user)
-    else:
-        user.access_token  = tokens.get("access_token")
-        user.refresh_token = tokens.get("refresh_token", user.refresh_token)
-        user.token_expiry  = expiry
-        user.name          = user_info.get("name")
-        user.picture       = user_info.get("picture")
 
     await db.commit()
     await db.refresh(user)
 
-    token = create_jwt(user.id, user.email)
-    return RedirectResponse(f"{FRONTEND_URL}/dashboard?token={token}")
+    # 4. Issue JWT and send user to frontend dashboard
+    token = create_token(user.id, user.email)
+    return RedirectResponse(
+        url=f"{FRONTEND_URL}/dashboard?token={token}",
+        status_code=302,
+    )
 
 
-@router.get("/me")
-async def get_me(authorization: str = None, db: AsyncSession = Depends(get_db)):
-    from fastapi import Header
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    payload = verify_jwt(authorization.replace("Bearer ", ""))
-    result = await db.execute(select(User).where(User.id == payload["sub"]))
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"id": user.id, "email": user.email, "name": user.name, "picture": user.picture}
+@router.get("/me", summary="Get current user")
+async def me(user: User = Depends(require_user)):
+    return {
+        "id":      user.id,
+        "email":   user.email,
+        "name":    user.name,
+        "picture": user.picture,
+    }
 
 
-@router.post("/logout")
+@router.post("/logout", summary="Logout")
 async def logout():
-    return {"message": "Logged out successfully"}
+    return {"message": "Delete your JWT client-side to logout"}

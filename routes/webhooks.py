@@ -1,21 +1,26 @@
 import base64
 import json
-from fastapi import APIRouter, Request, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
-from database import get_db, User
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from database import User, get_db
 
 router = APIRouter()
 
 
 @router.post("/gmail")
-async def gmail_push(request: Request, db: AsyncSession = Depends(get_db)):
+async def gmail_webhook(
+    request: Request,
+    db:      AsyncSession = Depends(get_db),
+):
+    """Receive Gmail Pub/Sub push notifications for real-time processing."""
     try:
         body    = await request.json()
         message = body.get("message", {})
-        data    = base64.b64decode(message.get("data", "") + "==").decode("utf-8")
-        payload = json.loads(data)
+        raw     = base64.b64decode(message.get("data", "") + "==").decode()
+        payload = json.loads(raw)
     except Exception:
         return {"status": "ignored"}
 
@@ -28,18 +33,30 @@ async def gmail_push(request: Request, db: AsyncSession = Depends(get_db)):
     if not user or not user.access_token:
         return {"status": "user_not_found"}
 
-    # Import here to avoid circular imports
-    from routes.emails import gmail_request, parse_message, analyze_email, save_email_record
+    # Late imports to avoid circular dependency at module load time
+    from ai_agent import analyze_email
+    from gmail_service import GmailService
+    from routes.emails import save_email_to_db
+
+    gmail = GmailService(user.access_token)
 
     try:
-        data_resp = await gmail_request(user.access_token, "/users/me/messages",
-                                        {"maxResults": 5, "q": "is:unread -from:me"})
-        for msg_ref in data_resp.get("messages", []):
-            raw      = await gmail_request(user.access_token, f"/users/me/messages/{msg_ref['id']}", {"format": "full"})
-            parsed   = parse_message(raw)
-            analysis = await analyze_email(parsed["subject"], parsed["body"], parsed["sender"])
-            if analysis["success"]:
-                await save_email_record(db, user, parsed, analysis)
+        raw_emails = await gmail.fetch_and_parse_unread(max_results=5)
+        for raw_email in raw_emails:
+            ctx = None
+            if raw_email.get("thread_id") and raw_email.get("gmail_message_id"):
+                ctx = await gmail.get_thread_context(
+                    raw_email["thread_id"], raw_email["gmail_message_id"]
+                ) or None
+            analysis = await analyze_email(
+                subject        = raw_email.get("subject", ""),
+                body           = raw_email.get("body", ""),
+                sender         = raw_email.get("sender", ""),
+                thread_context = ctx,
+            )
+            saved = await save_email_to_db(db, user, raw_email, analysis)
+            if saved and raw_email.get("gmail_message_id"):
+                await gmail.mark_as_read(raw_email["gmail_message_id"])
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 

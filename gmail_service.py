@@ -1,190 +1,224 @@
 """
-Gmail API integration — fetch, parse, and send emails.
+Gmail API service.
+Handles fetching, parsing, sending, and labelling emails.
 """
 import base64
-import email as email_lib
+import email as stdlib_email
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
-from datetime import datetime
+
 import httpx
-from config import get_settings
-
-settings = get_settings()
-
-GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
+from config import GMAIL_API_BASE
 
 
 class GmailService:
     def __init__(self, access_token: str):
-        self.access_token = access_token
-        self.headers = {"Authorization": f"Bearer {access_token}"}
+        self.token   = access_token
+        self._headers = {"Authorization": f"Bearer {access_token}"}
 
-    # ──────────────────────────────────────────
-    # Fetch Emails
-    # ──────────────────────────────────────────
+    # ── Low-level requests ────────────────────────────────────────────────────
 
-    async def list_messages(self, max_results: int = 20, query: str = "is:unread") -> list[dict]:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{GMAIL_API}/users/me/messages",
-                headers=self.headers,
-                params={"maxResults": max_results, "q": query}
+    async def _get(self, path: str, params: dict = None) -> dict:
+        url = f"{GMAIL_API_BASE}{path}"
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(url, headers=self._headers, params=params or {})
+            r.raise_for_status()
+            return r.json()
+
+    async def _post(self, path: str, body: dict) -> dict:
+        url = f"{GMAIL_API_BASE}{path}"
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
+                url,
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=body,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("messages", [])
+            r.raise_for_status()
+            return r.json()
 
-    async def get_message(self, message_id: str) -> dict:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{GMAIL_API}/users/me/messages/{message_id}",
-                headers=self.headers,
-                params={"format": "full"}
-            )
-            resp.raise_for_status()
-            return resp.json()
+    # ── List & fetch ──────────────────────────────────────────────────────────
 
-    async def get_thread(self, thread_id: str) -> dict:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{GMAIL_API}/users/me/threads/{thread_id}",
-                headers=self.headers
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-    # ──────────────────────────────────────────
-    # Parse Email
-    # ──────────────────────────────────────────
-
-    def parse_message(self, raw_message: dict) -> dict:
-        headers = {h["name"].lower(): h["value"] for h in raw_message.get("payload", {}).get("headers", [])}
-
-        body = self._extract_body(raw_message.get("payload", {}))
-
-        # Parse date
-        date_str = headers.get("date", "")
+    async def list_unread(self, max_results: int = 20) -> list[dict]:
+        """Return list of {id, threadId} stubs for unread inbox messages."""
         try:
-            received_at = email_lib.utils.parsedate_to_datetime(date_str)
+            data = await self._get("/users/me/messages", {
+                "maxResults": max_results,
+                "q":          "is:unread in:inbox -from:me",
+            })
+            return data.get("messages", [])
         except Exception:
-            received_at = datetime.utcnow()
+            return []
 
-        return {
-            "gmail_message_id": raw_message.get("id"),
-            "thread_id": raw_message.get("threadId"),
-            "sender": headers.get("from", ""),
-            "recipient": headers.get("to", ""),
-            "subject": headers.get("subject", "(no subject)"),
-            "body": body,
-            "received_at": received_at.isoformat(),
-            "raw_headers": dict(headers),
-        }
+    async def get_message(self, message_id: str) -> Optional[dict]:
+        """Fetch full message by ID."""
+        try:
+            return await self._get(f"/users/me/messages/{message_id}", {"format": "full"})
+        except Exception:
+            return None
 
-    def _extract_body(self, payload: dict) -> str:
-        """Recursively extract plain text body from Gmail payload."""
-        mime_type = payload.get("mimeType", "")
+    async def get_thread_messages(self, thread_id: str) -> list[dict]:
+        """Return all messages in a thread."""
+        try:
+            data = await self._get(f"/users/me/threads/{thread_id}")
+            return data.get("messages", [])
+        except Exception:
+            return []
 
-        if mime_type == "text/plain":
-            data = payload.get("body", {}).get("data", "")
-            if data:
-                return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="ignore")
+    # ── Parse ─────────────────────────────────────────────────────────────────
 
-        if mime_type.startswith("multipart/"):
+    @staticmethod
+    def _decode_body(payload: dict) -> str:
+        """Recursively extract plain-text body from Gmail message payload."""
+        mime = payload.get("mimeType", "")
+
+        if mime == "text/plain":
+            raw = payload.get("body", {}).get("data", "")
+            if raw:
+                try:
+                    return base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="ignore")
+                except Exception:
+                    return ""
+
+        if mime.startswith("multipart/"):
+            # Prefer text/plain parts
             for part in payload.get("parts", []):
-                body = self._extract_body(part)
-                if body:
-                    return body
+                if part.get("mimeType") == "text/plain":
+                    result = GmailService._decode_body(part)
+                    if result:
+                        return result
+            # Fall back to any part
+            for part in payload.get("parts", []):
+                result = GmailService._decode_body(part)
+                if result:
+                    return result
 
         return ""
 
-    def _extract_sender_name(self, from_header: str) -> str:
-        """Extract name from 'Name <email@domain.com>' format."""
-        if "<" in from_header:
-            return from_header.split("<")[0].strip().strip('"')
-        return from_header.split("@")[0]
+    def parse_message(self, raw: dict) -> dict:
+        """Convert raw Gmail API response into clean dict."""
+        if not raw:
+            return {}
 
-    def _extract_sender_email(self, from_header: str) -> str:
-        if "<" in from_header:
-            return from_header.split("<")[1].rstrip(">")
-        return from_header
+        hdrs = {
+            h["name"].lower(): h["value"]
+            for h in raw.get("payload", {}).get("headers", [])
+        }
 
-    # ──────────────────────────────────────────
-    # Send Email
-    # ──────────────────────────────────────────
+        # Parse received date
+        try:
+            received_at = stdlib_email.utils.parsedate_to_datetime(hdrs.get("date", ""))
+        except Exception:
+            received_at = datetime.utcnow()
 
-    async def send_reply(self, to: str, subject: str, body: str, thread_id: Optional[str] = None) -> dict:
-        message = MIMEText(body)
-        message["to"] = to
-        message["subject"] = subject if subject.startswith("Re:") else f"Re: {subject}"
+        body = self._decode_body(raw.get("payload", {}))
 
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        payload = {"raw": raw}
+        return {
+            "gmail_message_id": raw.get("id"),
+            "thread_id":        raw.get("threadId"),
+            "sender":           hdrs.get("from", ""),
+            "recipient":        hdrs.get("to", ""),
+            "subject":          hdrs.get("subject", "(no subject)"),
+            "body":             body,
+            "received_at":      received_at,
+            "raw_headers":      hdrs,
+        }
+
+    # ── Thread context ────────────────────────────────────────────────────────
+
+    async def get_thread_context(self, thread_id: str, skip_message_id: str) -> str:
+        """
+        Build a context string from previous messages in a thread.
+        Used to give AI conversation history.
+        """
+        messages = await self.get_thread_messages(thread_id)
+        parts = []
+        for msg in messages:
+            if msg.get("id") == skip_message_id:
+                continue
+            parsed = self.parse_message(msg)
+            snippet = (parsed.get("body") or "")[:400]
+            parts.append(
+                f"FROM: {parsed.get('sender', '')}\n"
+                f"SUBJECT: {parsed.get('subject', '')}\n"
+                f"{snippet}"
+            )
+        # Return last 3 messages as context
+        return "\n---\n".join(parts[-3:]) if parts else ""
+
+    # ── Send ──────────────────────────────────────────────────────────────────
+
+    async def send_reply(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: Optional[str] = None,
+    ) -> dict:
+        """Send a reply via Gmail API."""
+        # Build MIME message
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["To"]      = to
+        msg["Subject"] = subject if subject.startswith("Re:") else f"Re: {subject}"
+
+        raw_bytes = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+        payload: dict = {"raw": raw_bytes}
         if thread_id:
             payload["threadId"] = thread_id
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{GMAIL_API}/users/me/messages/send",
-                headers={**self.headers, "Content-Type": "application/json"},
-                json=payload
+        return await self._post("/users/me/messages/send", payload)
+
+    # ── Modify ────────────────────────────────────────────────────────────────
+
+    async def mark_as_read(self, message_id: str) -> None:
+        """Remove UNREAD label."""
+        try:
+            await self._post(
+                f"/users/me/messages/{message_id}/modify",
+                {"removeLabelIds": ["UNREAD"]},
             )
-            resp.raise_for_status()
-            return resp.json()
+        except Exception:
+            pass  # Non-critical — don't crash if this fails
 
-    async def mark_as_read(self, message_id: str):
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{GMAIL_API}/users/me/messages/{message_id}/modify",
-                headers={**self.headers, "Content-Type": "application/json"},
-                json={"removeLabelIds": ["UNREAD"]}
+    async def apply_label(self, message_id: str, label_name: str) -> None:
+        """Apply a named label to a message, creating the label if needed."""
+        try:
+            label_id = await self._get_or_create_label(label_name)
+            await self._post(
+                f"/users/me/messages/{message_id}/modify",
+                {"addLabelIds": [label_id]},
             )
+        except Exception:
+            pass
 
-    async def add_label(self, message_id: str, label_name: str):
-        # Get or create label first
-        label_id = await self._get_or_create_label(label_name)
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{GMAIL_API}/users/me/messages/{message_id}/modify",
-                headers={**self.headers, "Content-Type": "application/json"},
-                json={"addLabelIds": [label_id]}
-            )
+    async def _get_or_create_label(self, name: str) -> str:
+        data = await self._get("/users/me/labels")
+        for label in data.get("labels", []):
+            if label.get("name", "").lower() == name.lower():
+                return label["id"]
+        # Create new label
+        new_label = await self._post("/users/me/labels", {
+            "name": name,
+            "labelListVisibility":   "labelShow",
+            "messageListVisibility": "show",
+        })
+        return new_label["id"]
 
-    async def _get_or_create_label(self, label_name: str) -> str:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{GMAIL_API}/users/me/labels", headers=self.headers)
-            labels = resp.json().get("labels", [])
-            for label in labels:
-                if label["name"].lower() == label_name.lower():
-                    return label["id"]
+    # ── High-level fetch ──────────────────────────────────────────────────────
 
-            # Create it
-            resp = await client.post(
-                f"{GMAIL_API}/users/me/labels",
-                headers={**self.headers, "Content-Type": "application/json"},
-                json={"name": label_name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
-            )
-            return resp.json()["id"]
-
-    # ──────────────────────────────────────────
-    # Fetch + Parse in One Call
-    # ──────────────────────────────────────────
-
-    async def fetch_unread_emails(self, max_results: int = 20) -> list[dict]:
-        messages = await self.list_messages(max_results=max_results, query="is:unread -from:me")
-        parsed = []
-        for msg_ref in messages:
-            raw = await self.get_message(msg_ref["id"])
-            parsed.append(self.parse_message(raw))
-        return parsed
-
-    async def get_thread_context(self, thread_id: str, current_msg_id: str) -> str:
-        """Get previous messages in thread as context string."""
-        thread = await self.get_thread(thread_id)
-        messages = thread.get("messages", [])
-        context_parts = []
-        for msg in messages:
-            if msg.get("id") == current_msg_id:
-                break
-            parsed = self.parse_message(msg)
-            context_parts.append(f"FROM: {parsed['sender']}\nSUBJECT: {parsed['subject']}\n{parsed['body'][:500]}")
-        return "\n---\n".join(context_parts[-3:])  # Last 3 messages for context
+    async def fetch_and_parse_unread(self, max_results: int = 20) -> list[dict]:
+        """
+        Fetch unread messages and return list of parsed dicts.
+        Skips any messages that fail to fetch.
+        """
+        stubs = await self.list_unread(max_results)
+        results = []
+        for stub in stubs:
+            raw = await self.get_message(stub["id"])
+            if raw:
+                parsed = self.parse_message(raw)
+                if parsed:
+                    results.append(parsed)
+        return results
