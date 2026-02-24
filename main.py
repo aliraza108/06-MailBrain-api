@@ -683,9 +683,10 @@ async def _send_email_with_refresh(db: AsyncSession, user: User, to: str, subjec
         raise
 
 
-async def _fetch_unread(token, max_results=20) -> list:
+async def _fetch_inbox_messages(token, max_results=20, unread_only: bool = False) -> list:
+    query = "is:unread -from:me" if unread_only else "in:inbox -from:me newer_than:7d"
     data = await _gmail_get(token, "/users/me/messages",
-                            params={"q": "is:unread -from:me",
+                            params={"q": query,
                                     "maxResults": max_results})
     msgs = data.get("messages", []) or []
     out = []
@@ -1187,6 +1188,8 @@ async def list_emails(
 @app.api_route("/emails/sync", methods=["GET", "POST"])
 async def sync_emails(
     max_results: int = 20,
+    unread_only: bool = False,
+    mark_as_read: bool = False,
     user: User = Depends(auth),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1194,12 +1197,12 @@ async def sync_emails(
         raise HTTPException(400, "No Gmail token. Visit /auth/google to reconnect.")
 
     try:
-        raw_emails = await _fetch_unread(user.access_token, max_results)
+        raw_emails = await _fetch_inbox_messages(user.access_token, max_results, unread_only)
     except httpx.HTTPStatusError as e:
         if e.response is not None and e.response.status_code == 401:
             if user.refresh_token:
                 await _refresh_google_token(db, user)
-                raw_emails = await _fetch_unread(user.access_token, max_results)
+                raw_emails = await _fetch_inbox_messages(user.access_token, max_results, unread_only)
             else:
                 raise HTTPException(401, "Gmail token expired. Reconnect.")
         else:
@@ -1239,7 +1242,7 @@ async def sync_emails(
                 "action": saved.action_taken,
                 "reply_sent": saved.reply_sent,
             })
-            if raw.get("gmail_message_id"):
+            if mark_as_read and raw.get("gmail_message_id"):
                 try:
                     await _gmail_post(
                         user.access_token,
@@ -1808,7 +1811,7 @@ async def webhook_gmail(request: Request, db: AsyncSession = Depends(get_db)):
     try:
         profile = await _get_or_create_user_profile(db, user)
         profile_ctx = _profile_system_context(profile)
-        raw_emails = await _fetch_unread(user.access_token, 5)
+        raw_emails = await _fetch_inbox_messages(user.access_token, 5, unread_only=False)
         for raw_email in raw_emails:
             ctx = None
             if raw_email.get("thread_id") and raw_email.get("gmail_message_id"):
@@ -1821,15 +1824,6 @@ async def webhook_gmail(request: Request, db: AsyncSession = Depends(get_db)):
                 profile_ctx,
             )
             saved = await save_email(db, user, raw_email, analysis)
-            if saved and raw_email.get("gmail_message_id"):
-                try:
-                    await _gmail_post(
-                        user.access_token,
-                        f"/users/me/messages/{raw_email['gmail_message_id']}/modify",
-                        {"removeLabelIds": ["UNREAD"]},
-                    )
-                except Exception:
-                    pass
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
