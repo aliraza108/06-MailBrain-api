@@ -3,7 +3,7 @@ MailBrain API - single file for Vercel serverless
 """
 import os, sys, uuid, base64, json, re, traceback, httpx, jwt
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from typing import Optional
 import email as stdlib_email
@@ -30,6 +30,11 @@ AI_MODEL             = os.environ.get("AI_MODEL", "gemini-2.5-flash")
 AI_URL               = "https://generativelanguage.googleapis.com/v1beta/openai/"
 AUTO_THRESHOLD       = float(os.environ.get("AUTO_SEND_CONFIDENCE_THRESHOLD", "0.85"))
 DATABASE_URL         = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./mailbrain.db")
+CORS_ORIGINS_RAW     = os.environ.get(
+    "CORS_ORIGINS",
+    f"{FRONTEND_URL},http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+)
+CORS_ORIGINS         = [o.strip() for o in CORS_ORIGINS_RAW.split(",") if o.strip()]
 
 # Auto-fix DATABASE_URL for asyncpg
 if DATABASE_URL.startswith("postgres://"):
@@ -134,8 +139,13 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="MailBrain API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.exception_handler(Exception)
 async def global_error(request: Request, exc: Exception):
@@ -305,6 +315,14 @@ def _b64_decode(data: str) -> str:
         return ""
 
 
+def _to_utc_naive(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _extract_body(payload) -> str:
     try:
         if not payload:
@@ -347,7 +365,7 @@ def _parse_msg(raw) -> dict:
     received_at = None
     if date_str:
         try:
-            received_at = stdlib_email.utils.parsedate_to_datetime(date_str)
+            received_at = _to_utc_naive(stdlib_email.utils.parsedate_to_datetime(date_str))
         except Exception:
             received_at = None
     if not received_at:
@@ -464,7 +482,7 @@ async def save_email(db, user, raw, analysis) -> Optional[EmailRecord]:
         recipient=raw.get("recipient"),
         subject=raw.get("subject"),
         body=raw.get("body"),
-        received_at=raw.get("received_at"),
+        received_at=_to_utc_naive(raw.get("received_at")),
         intent=data.get("intent"),
         priority=data.get("priority"),
         priority_score=data.get("priority_score"),
@@ -744,7 +762,7 @@ async def list_emails(
     }
 
 
-@app.post("/emails/sync")
+@app.api_route("/emails/sync", methods=["GET", "POST"])
 async def sync_emails(
     max_results: int = 20,
     user: User = Depends(auth),
@@ -800,6 +818,7 @@ async def sync_emails(
                 except Exception:
                     pass
         except Exception as e:
+            await db.rollback()
             errors.append({"subject": raw.get("subject", "?"), "error": str(e)})
 
     return {
