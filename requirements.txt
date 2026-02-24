@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 sqlalchemy
-aiosqlite
 asyncpg
+aiosqlite
 pydantic
 pydantic-settings
 httpx
