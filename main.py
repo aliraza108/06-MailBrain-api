@@ -536,6 +536,9 @@ class BatchIn(BaseModel):
 class ReplyIn(BaseModel):
     body: str
 
+class DevTokenIn(BaseModel):
+    email: str
+
 # Section 10: Routes
 
 @app.get("/")
@@ -569,6 +572,7 @@ async def debug():
         "DATABASE_URL": "SET" if os.environ.get("DATABASE_URL") else "MISSING",
         "AI_MODEL": "SET" if os.environ.get("AI_MODEL") else "MISSING",
         "AUTO_SEND_CONFIDENCE_THRESHOLD": "SET" if os.environ.get("AUTO_SEND_CONFIDENCE_THRESHOLD") else "MISSING",
+        "ALLOW_DEV_TOKEN": "SET" if os.environ.get("ALLOW_DEV_TOKEN") else "MISSING",
     }
     return {"routes": routes, "env": env}
 
@@ -647,6 +651,17 @@ async def auth_me(user: User = Depends(auth)):
 @app.post("/auth/logout")
 async def auth_logout():
     return {"message": "Delete JWT client-side"}
+
+@app.post("/auth/dev-token")
+async def auth_dev_token(data: DevTokenIn, db: AsyncSession = Depends(get_db)):
+    if os.environ.get("ALLOW_DEV_TOKEN") != "1":
+        raise HTTPException(403, "Dev token disabled")
+    res = await db.execute(select(User).where(User.email == data.email))
+    user = res.scalar_one_or_none()
+    if not user:
+        raise HTTPException(404, "User not found")
+    token = make_token(user.id, user.email)
+    return {"token": token}
 
 
 async def _refresh_google_token(db: AsyncSession, user: User) -> str:
