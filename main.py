@@ -15,7 +15,7 @@ except Exception:
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlalchemy import (Column, String, Integer, DateTime, Text, Float,
                         Boolean, JSON, func, desc, select, text)
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -854,19 +854,45 @@ class GenerateEmailIn(BaseModel):
 
 class GenerateJobEmailIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    job_post_body: str = Field(validation_alias=AliasChoices("job_post_body", "post_body"))
-    recipient_email: str = Field(validation_alias=AliasChoices("recipient_email", "to"))
+    recipient_email: Optional[str] = None
+    to: Optional[str] = None
+    job_post_body: Optional[str] = None
+    post_body: Optional[str] = None
+    body: Optional[str] = None
     candidate_name: Optional[str] = ""
     candidate_background: Optional[str] = ""
     portfolio_url: Optional[str] = ""
     tone: Optional[str] = "confident"
     language: Optional[str] = "en"
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if not data.get("recipient_email") and data.get("to"):
+            data["recipient_email"] = data["to"]
+        if not data.get("job_post_body") and data.get("post_body"):
+            data["job_post_body"] = data["post_body"]
+        return data
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        if not (self.recipient_email and self.recipient_email.strip()):
+            raise ValueError("'recipient_email' or 'to' is required")
+        if not (self.body and self.body.strip()) and not (self.job_post_body and self.job_post_body.strip()):
+            raise ValueError("Either 'body' or 'job_post_body' (or 'post_body') is required")
+        return self
+
 
 class GenerateProposalIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    post_body: str = Field(validation_alias=AliasChoices("post_body", "job_post_body"))
-    customer_email: str = Field(validation_alias=AliasChoices("customer_email", "to"))
+    customer_email: Optional[str] = None
+    to: Optional[str] = None
+    post_body: Optional[str] = None
+    job_post_body: Optional[str] = None
+    body: Optional[str] = None
     sender_name: Optional[str] = ""
     company_name: Optional[str] = ""
     offer_summary: Optional[str] = ""
@@ -874,6 +900,26 @@ class GenerateProposalIn(BaseModel):
     budget_hint: Optional[str] = ""
     tone: Optional[str] = "consultative"
     language: Optional[str] = "en"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if not data.get("customer_email") and data.get("to"):
+            data["customer_email"] = data["to"]
+        if not data.get("post_body") and data.get("job_post_body"):
+            data["post_body"] = data["job_post_body"]
+        return data
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        if not (self.customer_email and self.customer_email.strip()):
+            raise ValueError("'customer_email' or 'to' is required")
+        if not (self.body and self.body.strip()) and not (self.post_body and self.post_body.strip()):
+            raise ValueError("Either 'body' or 'post_body' (or 'job_post_body') is required")
+        return self
 
 
 class GenerateFollowUpIn(BaseModel):
@@ -898,10 +944,10 @@ class GenerateAndSendIn(BaseModel):
 
 class JobApplySendIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    recipient_email: str = Field(validation_alias=AliasChoices("recipient_email", "to"))
-    job_post_body: Optional[str] = Field(
-        default=None, validation_alias=AliasChoices("job_post_body", "post_body")
-    )
+    recipient_email: Optional[str] = None
+    to: Optional[str] = None
+    job_post_body: Optional[str] = None
+    post_body: Optional[str] = None
     body: Optional[str] = None
     candidate_name: Optional[str] = ""
     candidate_background: Optional[str] = ""
@@ -911,19 +957,33 @@ class JobApplySendIn(BaseModel):
     language: Optional[str] = "en"
     conversation_id: Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if not data.get("recipient_email") and data.get("to"):
+            data["recipient_email"] = data["to"]
+        if not data.get("job_post_body") and data.get("post_body"):
+            data["job_post_body"] = data["post_body"]
+        return data
+
     @model_validator(mode="after")
     def validate_content(self):
+        if not (self.recipient_email and self.recipient_email.strip()):
+            raise ValueError("'recipient_email' or 'to' is required")
         if not (self.body and self.body.strip()) and not (self.job_post_body and self.job_post_body.strip()):
-            raise ValueError("Either 'body' or 'job_post_body' is required")
+            raise ValueError("Either 'body' or 'job_post_body' (or 'post_body') is required")
         return self
 
 
 class ProposalSendIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    customer_email: str = Field(validation_alias=AliasChoices("customer_email", "to"))
-    post_body: Optional[str] = Field(
-        default=None, validation_alias=AliasChoices("post_body", "job_post_body")
-    )
+    customer_email: Optional[str] = None
+    to: Optional[str] = None
+    post_body: Optional[str] = None
+    job_post_body: Optional[str] = None
     body: Optional[str] = None
     sender_name: Optional[str] = ""
     company_name: Optional[str] = ""
@@ -935,10 +995,24 @@ class ProposalSendIn(BaseModel):
     language: Optional[str] = "en"
     conversation_id: Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_aliases(cls, value):
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if not data.get("customer_email") and data.get("to"):
+            data["customer_email"] = data["to"]
+        if not data.get("post_body") and data.get("job_post_body"):
+            data["post_body"] = data["job_post_body"]
+        return data
+
     @model_validator(mode="after")
     def validate_content(self):
+        if not (self.customer_email and self.customer_email.strip()):
+            raise ValueError("'customer_email' or 'to' is required")
         if not (self.body and self.body.strip()) and not (self.post_body and self.post_body.strip()):
-            raise ValueError("Either 'body' or 'post_body' is required")
+            raise ValueError("Either 'body' or 'post_body' (or 'job_post_body') is required")
         return self
 
 
@@ -1503,9 +1577,12 @@ async def generate_job_email(
     db: AsyncSession = Depends(get_db),
 ):
     profile = await _get_or_create_user_profile(db, user)
-    system_prompt, user_prompt = _build_job_email_prompt(data)
-    system_prompt = _merge_system_prompt(system_prompt, profile)
-    body = await _llm_generate_email(system_prompt, user_prompt)
+    if data.body and data.body.strip():
+        body = data.body.strip()
+    else:
+        system_prompt, user_prompt = _build_job_email_prompt(data)
+        system_prompt = _merge_system_prompt(system_prompt, profile)
+        body = await _llm_generate_email(system_prompt, user_prompt)
     return {
         "to": data.recipient_email,
         "suggested_subject": "Application for the role",
@@ -1521,9 +1598,12 @@ async def generate_proposal_email(
     db: AsyncSession = Depends(get_db),
 ):
     profile = await _get_or_create_user_profile(db, user)
-    system_prompt, user_prompt = _build_proposal_prompt(data)
-    system_prompt = _merge_system_prompt(system_prompt, profile)
-    body = await _llm_generate_email(system_prompt, user_prompt)
+    if data.body and data.body.strip():
+        body = data.body.strip()
+    else:
+        system_prompt, user_prompt = _build_proposal_prompt(data)
+        system_prompt = _merge_system_prompt(system_prompt, profile)
+        body = await _llm_generate_email(system_prompt, user_prompt)
     return {
         "to": data.customer_email,
         "suggested_subject": "Project Proposal",
