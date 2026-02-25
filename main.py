@@ -15,7 +15,7 @@ except Exception:
 from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
 from sqlalchemy import (Column, String, Integer, DateTime, Text, Float,
                         Boolean, JSON, func, desc, select, text)
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -853,8 +853,9 @@ class GenerateEmailIn(BaseModel):
 
 
 class GenerateJobEmailIn(BaseModel):
-    job_post_body: str
-    recipient_email: str
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    job_post_body: str = Field(validation_alias=AliasChoices("job_post_body", "post_body"))
+    recipient_email: str = Field(validation_alias=AliasChoices("recipient_email", "to"))
     candidate_name: Optional[str] = ""
     candidate_background: Optional[str] = ""
     portfolio_url: Optional[str] = ""
@@ -863,8 +864,9 @@ class GenerateJobEmailIn(BaseModel):
 
 
 class GenerateProposalIn(BaseModel):
-    post_body: str
-    customer_email: str
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    post_body: str = Field(validation_alias=AliasChoices("post_body", "job_post_body"))
+    customer_email: str = Field(validation_alias=AliasChoices("customer_email", "to"))
     sender_name: Optional[str] = ""
     company_name: Optional[str] = ""
     offer_summary: Optional[str] = ""
@@ -895,8 +897,12 @@ class GenerateAndSendIn(BaseModel):
 
 
 class JobApplySendIn(BaseModel):
-    recipient_email: str
-    job_post_body: str
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    recipient_email: str = Field(validation_alias=AliasChoices("recipient_email", "to"))
+    job_post_body: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("job_post_body", "post_body")
+    )
+    body: Optional[str] = None
     candidate_name: Optional[str] = ""
     candidate_background: Optional[str] = ""
     portfolio_url: Optional[str] = ""
@@ -905,10 +911,20 @@ class JobApplySendIn(BaseModel):
     language: Optional[str] = "en"
     conversation_id: Optional[str] = None
 
+    @model_validator(mode="after")
+    def validate_content(self):
+        if not (self.body and self.body.strip()) and not (self.job_post_body and self.job_post_body.strip()):
+            raise ValueError("Either 'body' or 'job_post_body' is required")
+        return self
+
 
 class ProposalSendIn(BaseModel):
-    customer_email: str
-    post_body: str
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    customer_email: str = Field(validation_alias=AliasChoices("customer_email", "to"))
+    post_body: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("post_body", "job_post_body")
+    )
+    body: Optional[str] = None
     sender_name: Optional[str] = ""
     company_name: Optional[str] = ""
     offer_summary: Optional[str] = ""
@@ -918,6 +934,12 @@ class ProposalSendIn(BaseModel):
     tone: Optional[str] = "consultative"
     language: Optional[str] = "en"
     conversation_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        if not (self.body and self.body.strip()) and not (self.post_body and self.post_body.strip()):
+            raise ValueError("Either 'body' or 'post_body' is required")
+        return self
 
 
 class SubjectIdeasIn(BaseModel):
@@ -1574,19 +1596,22 @@ async def job_apply_send(
 ):
     if not user.access_token:
         raise HTTPException(400, "No Gmail token")
-    gen = GenerateJobEmailIn(
-        job_post_body=data.job_post_body,
-        recipient_email=data.recipient_email,
-        candidate_name=data.candidate_name,
-        candidate_background=data.candidate_background,
-        portfolio_url=data.portfolio_url,
-        tone=data.tone,
-        language=data.language,
-    )
-    profile = await _get_or_create_user_profile(db, user)
-    system_prompt, user_prompt = _build_job_email_prompt(gen)
-    system_prompt = _merge_system_prompt(system_prompt, profile)
-    body = await _llm_generate_email(system_prompt, user_prompt)
+    if data.body and data.body.strip():
+        body = data.body.strip()
+    else:
+        gen = GenerateJobEmailIn(
+            job_post_body=(data.job_post_body or "").strip(),
+            recipient_email=data.recipient_email,
+            candidate_name=data.candidate_name,
+            candidate_background=data.candidate_background,
+            portfolio_url=data.portfolio_url,
+            tone=data.tone,
+            language=data.language,
+        )
+        profile = await _get_or_create_user_profile(db, user)
+        system_prompt, user_prompt = _build_job_email_prompt(gen)
+        system_prompt = _merge_system_prompt(system_prompt, profile)
+        body = await _llm_generate_email(system_prompt, user_prompt)
     sent = await _send_email_with_refresh(
         db,
         user,
@@ -1614,21 +1639,24 @@ async def proposal_send(
 ):
     if not user.access_token:
         raise HTTPException(400, "No Gmail token")
-    gen = GenerateProposalIn(
-        post_body=data.post_body,
-        customer_email=data.customer_email,
-        sender_name=data.sender_name,
-        company_name=data.company_name,
-        offer_summary=data.offer_summary,
-        timeline=data.timeline,
-        budget_hint=data.budget_hint,
-        tone=data.tone,
-        language=data.language,
-    )
-    profile = await _get_or_create_user_profile(db, user)
-    system_prompt, user_prompt = _build_proposal_prompt(gen)
-    system_prompt = _merge_system_prompt(system_prompt, profile)
-    body = await _llm_generate_email(system_prompt, user_prompt)
+    if data.body and data.body.strip():
+        body = data.body.strip()
+    else:
+        gen = GenerateProposalIn(
+            post_body=(data.post_body or "").strip(),
+            customer_email=data.customer_email,
+            sender_name=data.sender_name,
+            company_name=data.company_name,
+            offer_summary=data.offer_summary,
+            timeline=data.timeline,
+            budget_hint=data.budget_hint,
+            tone=data.tone,
+            language=data.language,
+        )
+        profile = await _get_or_create_user_profile(db, user)
+        system_prompt, user_prompt = _build_proposal_prompt(gen)
+        system_prompt = _merge_system_prompt(system_prompt, profile)
+        body = await _llm_generate_email(system_prompt, user_prompt)
     sent = await _send_email_with_refresh(
         db,
         user,
