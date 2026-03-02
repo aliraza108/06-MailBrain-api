@@ -3,7 +3,9 @@ Gmail API service.
 Handles fetching, parsing, sending, and labelling emails.
 """
 import base64
+import asyncio
 import email as stdlib_email
+import re
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -20,15 +22,27 @@ class GmailService:
 
     # ── Low-level requests ────────────────────────────────────────────────────
 
-    async def _get(self, path: str, params: dict = None) -> dict:
+    async def _get(self, path: str, params: dict = None, client: Optional[httpx.AsyncClient] = None) -> dict:
         url = f"{GMAIL_API_BASE}{path}"
+        if client is not None:
+            r = await client.get(url, headers=self._headers, params=params or {})
+            r.raise_for_status()
+            return r.json()
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.get(url, headers=self._headers, params=params or {})
             r.raise_for_status()
             return r.json()
 
-    async def _post(self, path: str, body: dict) -> dict:
+    async def _post(self, path: str, body: dict, client: Optional[httpx.AsyncClient] = None) -> dict:
         url = f"{GMAIL_API_BASE}{path}"
+        if client is not None:
+            r = await client.post(
+                url,
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=body,
+            )
+            r.raise_for_status()
+            return r.json()
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(
                 url,
@@ -40,28 +54,29 @@ class GmailService:
 
     # ── List & fetch ──────────────────────────────────────────────────────────
 
-    async def list_unread(self, max_results: int = 20) -> list[dict]:
+    async def list_unread(self, max_results: int = 20, client: Optional[httpx.AsyncClient] = None) -> list[dict]:
         """Return list of {id, threadId} stubs for unread inbox messages."""
         try:
+            max_results = max(1, min(int(max_results or 20), 100))
             data = await self._get("/users/me/messages", {
                 "maxResults": max_results,
                 "q":          "is:unread in:inbox -from:me",
-            })
+            }, client=client)
             return data.get("messages", [])
         except Exception:
             return []
 
-    async def get_message(self, message_id: str) -> Optional[dict]:
+    async def get_message(self, message_id: str, client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
         """Fetch full message by ID."""
         try:
-            return await self._get(f"/users/me/messages/{message_id}", {"format": "full"})
+            return await self._get(f"/users/me/messages/{message_id}", {"format": "full"}, client=client)
         except Exception:
             return None
 
-    async def get_thread_messages(self, thread_id: str) -> list[dict]:
+    async def get_thread_messages(self, thread_id: str, client: Optional[httpx.AsyncClient] = None) -> list[dict]:
         """Return all messages in a thread."""
         try:
-            data = await self._get(f"/users/me/threads/{thread_id}")
+            data = await self._get(f"/users/me/threads/{thread_id}", {"format": "full"}, client=client)
             return data.get("messages", [])
         except Exception:
             return []
@@ -78,6 +93,20 @@ class GmailService:
             if raw:
                 try:
                     return base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="ignore")
+                except Exception:
+                    return ""
+        if mime == "text/html":
+            raw = payload.get("body", {}).get("data", "")
+            if raw:
+                try:
+                    html = base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="ignore")
+                    html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+                    html = re.sub(r"(?is)<br\s*/?>", "\n", html)
+                    html = re.sub(r"(?is)</p\s*>", "\n", html)
+                    text = re.sub(r"(?is)<[^>]+>", " ", html)
+                    text = re.sub(r"[ \t]+", " ", text)
+                    text = re.sub(r"\n{3,}", "\n\n", text)
+                    return text.strip()
                 except Exception:
                     return ""
 
@@ -112,7 +141,7 @@ class GmailService:
         except Exception:
             received_at = datetime.utcnow()
 
-        body = self._decode_body(raw.get("payload", {}))
+        body = self._decode_body(raw.get("payload", {})) or (raw.get("snippet", "") or "")
 
         return {
             "gmail_message_id": raw.get("id"),
@@ -213,12 +242,23 @@ class GmailService:
         Fetch unread messages and return list of parsed dicts.
         Skips any messages that fail to fetch.
         """
-        stubs = await self.list_unread(max_results)
-        results = []
-        for stub in stubs:
-            raw = await self.get_message(stub["id"])
-            if raw:
+        async with httpx.AsyncClient(timeout=30) as client:
+            stubs = await self.list_unread(max_results, client=client)
+            if not stubs:
+                return []
+
+            sem = asyncio.Semaphore(10)
+
+            async def _fetch_one(message_id: str) -> Optional[dict]:
+                async with sem:
+                    return await self.get_message(message_id, client=client)
+
+            raws = await asyncio.gather(*[_fetch_one(s["id"]) for s in stubs if s.get("id")])
+            results = []
+            for raw in raws:
+                if not raw:
+                    continue
                 parsed = self.parse_message(raw)
                 if parsed:
                     results.append(parsed)
-        return results
+            return results

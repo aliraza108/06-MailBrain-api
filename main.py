@@ -1,7 +1,7 @@
 """
 MailBrain API - single file for Vercel serverless
 """
-import os, sys, uuid, base64, json, re, traceback, httpx, jwt
+import os, sys, uuid, base64, json, re, traceback, httpx, jwt, asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -584,6 +584,17 @@ def _extract_body(payload) -> str:
         data = body.get("data")
         if mime == "text/plain" and data:
             return _b64_decode(data)
+        if mime == "text/html" and data:
+            html = _b64_decode(data)
+            if not html:
+                return ""
+            html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+            html = re.sub(r"(?is)<br\s*/?>", "\n", html)
+            html = re.sub(r"(?is)</p\s*>", "\n", html)
+            text = re.sub(r"(?is)<[^>]+>", " ", html)
+            text = re.sub(r"[ \t]+", " ", text)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            return text.strip()
         if mime.startswith("multipart/"):
             parts = payload.get("parts", []) or []
             for p in parts:
@@ -629,21 +640,25 @@ def _parse_msg(raw) -> dict:
         "sender": headers_l.get("from", ""),
         "recipient": headers_l.get("to", ""),
         "subject": headers_l.get("subject", ""),
-        "body": _extract_body(payload),
+        "body": _extract_body(payload) or (raw.get("snippet", "") or ""),
         "received_at": received_at,
         "raw_headers": headers,
     }
 
 
+async def _gmail_get_client(client: httpx.AsyncClient, token, path, params=None) -> dict:
+    resp = await client.get(
+        f"{GMAIL_BASE}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 async def _gmail_get(token, path, params=None) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{GMAIL_BASE}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        return await _gmail_get_client(client, token, path, params)
 
 
 async def _gmail_post(token, path, body) -> dict:
@@ -684,31 +699,45 @@ async def _send_email_with_refresh(db: AsyncSession, user: User, to: str, subjec
 
 
 async def _fetch_inbox_messages(token, max_results=20, unread_only: bool = False, lookback_days: int = 10) -> list:
+    max_results = max(1, min(int(max_results or 20), 100))
     days = max(1, min(int(lookback_days or 10), 30))
-    category_filter = "{category:primary category:updates} -category:promotions -category:social"
     query = (
-        f"is:unread -from:me {category_filter}"
+        "is:unread in:inbox -from:me"
         if unread_only
-        else f"in:inbox -from:me newer_than:{days}d {category_filter}"
+        else f"in:inbox -from:me newer_than:{days}d"
     )
-    data = await _gmail_get(token, "/users/me/messages",
-                            params={"q": query,
-                                    "maxResults": max_results})
-    msgs = data.get("messages", []) or []
-    out = []
-    for m in msgs:
-        try:
-            full = await _gmail_get(token, f"/users/me/messages/{m['id']}",
-                                    params={"format": "full"})
-            out.append(_parse_msg(full))
-        except Exception:
-            continue
-    return out
+    async with httpx.AsyncClient(timeout=30) as client:
+        data = await _gmail_get_client(
+            client,
+            token,
+            "/users/me/messages",
+            params={"q": query, "maxResults": max_results},
+        )
+        msgs = data.get("messages", []) or []
+        if not msgs:
+            return []
+
+        sem = asyncio.Semaphore(10)
+
+        async def _fetch_one(msg_id: str):
+            async with sem:
+                try:
+                    return await _gmail_get_client(
+                        client,
+                        token,
+                        f"/users/me/messages/{msg_id}",
+                        params={"format": "full"},
+                    )
+                except Exception:
+                    return None
+
+        raw_items = await asyncio.gather(*[_fetch_one(m["id"]) for m in msgs if m.get("id")])
+        return [_parse_msg(item) for item in raw_items if item]
 
 
 async def _thread_context(token, thread_id, skip_id) -> str:
     try:
-        data = await _gmail_get(token, f"/users/me/threads/{thread_id}")
+        data = await _gmail_get(token, f"/users/me/threads/{thread_id}", params={"format": "full"})
         msgs = data.get("messages", []) or []
         ctx = []
         for m in msgs:
