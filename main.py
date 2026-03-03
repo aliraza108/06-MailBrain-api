@@ -1513,7 +1513,7 @@ async def approve_reply(email_id: str, user: User = Depends(auth), db: AsyncSess
     if not user.access_token:
         raise HTTPException(400, "No Gmail token")
 
-    await _send_email(user.access_token, e.sender, e.subject, e.generated_reply, e.thread_id)
+    await _send_email_with_refresh(db, user, e.sender, e.subject, e.generated_reply, e.thread_id)
     e.reply_sent = True
     e.reply_sent_at = datetime.utcnow()
     await db.commit()
@@ -1537,7 +1537,7 @@ async def send_reply(
     if not user.access_token:
         raise HTTPException(400, "No Gmail token")
 
-    await _send_email(user.access_token, e.sender, e.subject, reply.body, e.thread_id)
+    await _send_email_with_refresh(db, user, e.sender, e.subject, reply.body, e.thread_id)
     e.reply_sent = True
     e.reply_sent_at = datetime.utcnow()
     e.generated_reply = reply.body

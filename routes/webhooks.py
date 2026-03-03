@@ -36,7 +36,12 @@ async def gmail_webhook(
     # Late imports to avoid circular dependency at module load time
     from ai_agent import analyze_email
     from gmail_service import GmailService
-    from routes.emails import save_email_to_db
+    from routes.emails import ensure_access_token, save_email_to_db
+
+    try:
+        await ensure_access_token(db, user)
+    except Exception as e:
+        return {"status": "token_error", "detail": str(e)}
 
     gmail = GmailService(user.access_token)
 

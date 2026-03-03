@@ -54,7 +54,12 @@ class GmailService:
 
     # ── List & fetch ──────────────────────────────────────────────────────────
 
-    async def list_unread(self, max_results: int = 20, client: Optional[httpx.AsyncClient] = None) -> list[dict]:
+    async def list_unread(
+        self,
+        max_results: int = 20,
+        client: Optional[httpx.AsyncClient] = None,
+        strict: bool = False,
+    ) -> list[dict]:
         """Return list of {id, threadId} stubs for unread inbox messages."""
         try:
             max_results = max(1, min(int(max_results or 20), 100))
@@ -64,6 +69,8 @@ class GmailService:
             }, client=client)
             return data.get("messages", [])
         except Exception:
+            if strict:
+                raise
             return []
 
     async def get_message(self, message_id: str, client: Optional[httpx.AsyncClient] = None) -> Optional[dict]:
@@ -243,7 +250,7 @@ class GmailService:
         Skips any messages that fail to fetch.
         """
         async with httpx.AsyncClient(timeout=30) as client:
-            stubs = await self.list_unread(max_results, client=client)
+            stubs = await self.list_unread(max_results, client=client, strict=True)
             if not stubs:
                 return []
 

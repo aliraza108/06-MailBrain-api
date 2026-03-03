@@ -2,13 +2,19 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_agent import analyze_email
-from config import AUTO_SEND_THRESHOLD
+from config import (
+    AUTO_SEND_THRESHOLD,
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_TOKEN_URL,
+)
 from database import ActivityLog, EmailRecord, User, get_db
 from gmail_service import GmailService
 from routes.auth import decode_token
@@ -30,6 +36,37 @@ async def require_user(
     if not user:
         raise HTTPException(404, "User not found")
     return user
+
+
+# Token refresh helpers
+async def refresh_google_token(db: AsyncSession, user: User) -> str:
+    if not user.refresh_token:
+        raise HTTPException(400, "No refresh token")
+    async with httpx.AsyncClient(timeout=30) as client:
+        tok = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": user.refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+    if tok.status_code != 200:
+        raise HTTPException(400, f"Refresh failed: {tok.text[:200]}")
+    data = tok.json()
+    user.access_token = data.get("access_token")
+    user.token_expiry = datetime.utcnow() + timedelta(seconds=data.get("expires_in", 3600))
+    await db.commit()
+    return user.access_token
+
+
+async def ensure_access_token(db: AsyncSession, user: User) -> str:
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token. Visit /auth/google to reconnect.")
+    if user.token_expiry and user.token_expiry <= datetime.utcnow() + timedelta(seconds=60):
+        return await refresh_google_token(db, user)
+    return user.access_token
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -119,13 +156,27 @@ async def save_email_to_db(
         and raw.get("sender")
     ):
         try:
+            await ensure_access_token(db, user)
             gmail = GmailService(user.access_token)
-            await gmail.send_reply(
-                to        = raw["sender"],
-                subject   = raw.get("subject", ""),
-                body      = d.get("generated_reply", ""),
-                thread_id = raw.get("thread_id"),
-            )
+            try:
+                await gmail.send_reply(
+                    to        = raw["sender"],
+                    subject   = raw.get("subject", ""),
+                    body      = d.get("generated_reply", ""),
+                    thread_id = raw.get("thread_id"),
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response is not None and e.response.status_code == 401 and user.refresh_token:
+                    await refresh_google_token(db, user)
+                    gmail = GmailService(user.access_token)
+                    await gmail.send_reply(
+                        to        = raw["sender"],
+                        subject   = raw.get("subject", ""),
+                        body      = d.get("generated_reply", ""),
+                        thread_id = raw.get("thread_id"),
+                    )
+                else:
+                    raise
             record.reply_sent    = True
             record.reply_sent_at = datetime.utcnow()
         except Exception as e:
@@ -207,14 +258,19 @@ async def sync_gmail(
     Pull unread Gmail messages, run AI analysis on each,
     save to database, mark as read.
     """
-    if not user.access_token:
-        raise HTTPException(400, "No Gmail token. Visit /auth/google to reconnect.")
-
+    await ensure_access_token(db, user)
     gmail = GmailService(user.access_token)
 
     # Fetch unread emails
     try:
         raw_emails = await gmail.fetch_and_parse_unread(max_results)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401 and user.refresh_token:
+            await refresh_google_token(db, user)
+            gmail = GmailService(user.access_token)
+            raw_emails = await gmail.fetch_and_parse_unread(max_results)
+        else:
+            raise HTTPException(400, f"Gmail fetch failed: {str(e)}")
     except Exception as e:
         raise HTTPException(400, f"Gmail fetch failed: {str(e)}")
 
@@ -394,12 +450,19 @@ async def approve_reply(
     if e.reply_sent:
         raise HTTPException(400, "Reply already sent")
     if not e.generated_reply:
-        raise HTTPException(400, "No AI reply available — process the email first")
-    if not user.access_token:
-        raise HTTPException(400, "No Gmail token — reconnect at /auth/google")
+        raise HTTPException(400, "No AI reply available - process the email first")
+    await ensure_access_token(db, user)
 
     gmail = GmailService(user.access_token)
-    await gmail.send_reply(e.sender, e.subject, e.generated_reply, e.thread_id)
+    try:
+        await gmail.send_reply(e.sender, e.subject, e.generated_reply, e.thread_id)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401 and user.refresh_token:
+            await refresh_google_token(db, user)
+            gmail = GmailService(user.access_token)
+            await gmail.send_reply(e.sender, e.subject, e.generated_reply, e.thread_id)
+        else:
+            raise
 
     e.reply_sent    = True
     e.reply_sent_at = datetime.utcnow()
@@ -424,11 +487,18 @@ async def send_custom_reply(
     e = result.scalar_one_or_none()
     if not e:
         raise HTTPException(404, "Email not found")
-    if not user.access_token:
-        raise HTTPException(400, "No Gmail token — reconnect at /auth/google")
+    await ensure_access_token(db, user)
 
     gmail = GmailService(user.access_token)
-    await gmail.send_reply(e.sender, e.subject, reply.body, e.thread_id)
+    try:
+        await gmail.send_reply(e.sender, e.subject, reply.body, e.thread_id)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401 and user.refresh_token:
+            await refresh_google_token(db, user)
+            gmail = GmailService(user.access_token)
+            await gmail.send_reply(e.sender, e.subject, reply.body, e.thread_id)
+        else:
+            raise
 
     e.reply_sent      = True
     e.reply_sent_at   = datetime.utcnow()
