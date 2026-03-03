@@ -808,8 +808,9 @@ async def save_email(db, user, raw, analysis) -> Optional[EmailRecord]:
         and raw.get("sender")
     ):
         try:
-            await _send_email(
-                user.access_token,
+            await _send_email_with_refresh(
+                db,
+                user,
                 raw.get("sender"),
                 raw.get("subject"),
                 data.get("generated_reply"),
@@ -1255,6 +1256,14 @@ async def _refresh_google_token(db: AsyncSession, user: User) -> str:
     return user.access_token
 
 
+async def _ensure_access_token(db: AsyncSession, user: User) -> str:
+    if not user.access_token:
+        raise HTTPException(400, "No Gmail token. Visit /auth/google to reconnect.")
+    if user.token_expiry and user.token_expiry <= datetime.utcnow() + timedelta(seconds=60):
+        return await _refresh_google_token(db, user)
+    return user.access_token
+
+
 @app.post("/auth/refresh")
 async def auth_refresh(user: User = Depends(auth), db: AsyncSession = Depends(get_db)):
     token = await _refresh_google_token(db, user)
@@ -1325,8 +1334,7 @@ async def sync_emails(
     user: User = Depends(auth),
     db: AsyncSession = Depends(get_db),
 ):
-    if not user.access_token:
-        raise HTTPException(400, "No Gmail token. Visit /auth/google to reconnect.")
+    await _ensure_access_token(db, user)
 
     try:
         raw_emails = await _fetch_inbox_messages(user.access_token, max_results, unread_only, lookback_days)
@@ -1509,9 +1517,19 @@ async def approve_reply(email_id: str, user: User = Depends(auth), db: AsyncSess
     if e.reply_sent:
         raise HTTPException(400, "Reply already sent")
     if not e.generated_reply:
-        raise HTTPException(400, "No reply to send")
-    if not user.access_token:
-        raise HTTPException(400, "No Gmail token")
+        # Generate reply on demand if missing
+        profile = await _get_or_create_user_profile(db, user)
+        analysis = await ai_analyze(
+            e.subject or "",
+            e.body or "",
+            e.sender or "",
+            None,
+            _profile_system_context(profile),
+        )
+        e.generated_reply = (analysis.get("data") or {}).get("generated_reply") or ""
+        if not e.generated_reply:
+            raise HTTPException(400, "No reply to send")
+    await _ensure_access_token(db, user)
 
     await _send_email_with_refresh(db, user, e.sender, e.subject, e.generated_reply, e.thread_id)
     e.reply_sent = True
@@ -1534,8 +1552,7 @@ async def send_reply(
     e = res.scalar_one_or_none()
     if not e:
         raise HTTPException(404, "Email not found")
-    if not user.access_token:
-        raise HTTPException(400, "No Gmail token")
+    await _ensure_access_token(db, user)
 
     await _send_email_with_refresh(db, user, e.sender, e.subject, reply.body, e.thread_id)
     e.reply_sent = True
@@ -1964,6 +1981,7 @@ async def webhook_gmail(request: Request, db: AsyncSession = Depends(get_db)):
         return {"status": "ignored"}
 
     try:
+        await _ensure_access_token(db, user)
         profile = await _get_or_create_user_profile(db, user)
         profile_ctx = _profile_system_context(profile)
         raw_emails = await _fetch_inbox_messages(user.access_token, 5, unread_only=False, lookback_days=10)
